@@ -282,12 +282,14 @@ public class DynamoDbJsonHandler {
         String filterExpr = request.has("FilterExpression")
                 ? request.get("FilterExpression").asText() : null;
         Integer limit = request.has("Limit") ? request.get("Limit").asInt() : null;
+        Boolean scanIndexForward = request.has("ScanIndexForward")
+                ? request.get("ScanIndexForward").asBoolean() : null;
         String indexName = request.has("IndexName") ? request.get("IndexName").asText() : null;
         JsonNode exclusiveStartKey = request.has("ExclusiveStartKey")
                 ? request.get("ExclusiveStartKey") : null;
 
         DynamoDbService.QueryResult result = dynamoDbService.query(tableName, keyConditions,
-                exprAttrValues, keyConditionExpr, filterExpr, limit, indexName,
+                exprAttrValues, keyConditionExpr, filterExpr, limit, scanIndexForward, indexName,
                 exclusiveStartKey, exprAttrNames, region);
 
         ObjectNode response = objectMapper.createObjectNode();
@@ -310,12 +312,14 @@ public class DynamoDbJsonHandler {
                 ? request.get("ExpressionAttributeNames") : null;
         JsonNode exprAttrValues = request.has("ExpressionAttributeValues")
                 ? request.get("ExpressionAttributeValues") : null;
+        JsonNode scanFilter = request.has("ScanFilter")
+                ? request.get("ScanFilter") : null;
         Integer limit = request.has("Limit") ? request.get("Limit").asInt() : null;
         JsonNode exclusiveStartKey = request.has("ExclusiveStartKey")
                 ? request.get("ExclusiveStartKey") : null;
 
         DynamoDbService.ScanResult result = dynamoDbService.scan(
-                tableName, filterExpr, exprAttrNames, exprAttrValues, limit, exclusiveStartKey, region);
+                tableName, filterExpr, exprAttrNames, exprAttrValues, scanFilter, limit, exclusiveStartKey, region);
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode itemsArray = objectMapper.createArrayNode();

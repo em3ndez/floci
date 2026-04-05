@@ -249,6 +249,10 @@ public class LambdaController {
         node.put("BatchSize", esm.getBatchSize());
         node.put("State", esm.getState());
         node.put("LastModified", (double) esm.getLastModified() / 1000.0);
+        ArrayNode responseTypes = node.putArray("FunctionResponseTypes");
+        if (esm.getFunctionResponseTypes() != null) {
+            esm.getFunctionResponseTypes().forEach(responseTypes::add);
+        }
         @SuppressWarnings("unchecked")
         Map<String, Object> result = objectMapper.convertValue(node, Map.class);
         return result;
@@ -272,6 +276,20 @@ public class LambdaController {
         }
         LambdaFunction version = lambdaService.publishVersion(region, functionName, description);
         return Response.status(201).entity(buildFunctionConfiguration(version)).build();
+    }
+
+    @GET
+    @Path("/functions/{functionName}/versions")
+    public Response listVersionsByFunction(@Context HttpHeaders headers,
+                                           @PathParam("functionName") String functionName) {
+        String region = regionResolver.resolveRegion(headers);
+        List<LambdaFunction> versions = lambdaService.listVersionsByFunction(region, functionName);
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode items = root.putArray("Versions");
+        for (LambdaFunction v : versions) {
+            items.add(objectMapper.valueToTree(buildFunctionConfiguration(v)));
+        }
+        return Response.ok(root).build();
     }
 
     // ──────────────────────────── Aliases ────────────────────────────
@@ -384,7 +402,7 @@ public class LambdaController {
         if (fn.getImageUri() != null) node.put("ImageUri", fn.getImageUri());
         node.put("LastModified", String.valueOf(fn.getLastModified()));
         node.put("RevisionId", fn.getRevisionId());
-        node.put("Version", "$LATEST");
+        node.put("Version", fn.getVersion());
 
         if (fn.getEnvironment() != null && !fn.getEnvironment().isEmpty()) {
             ObjectNode envNode = node.putObject("Environment");

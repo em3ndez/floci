@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
+import io.github.hectorvent.floci.core.common.XmlParser;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.s3.model.*;
@@ -37,6 +38,9 @@ public class S3Service {
     private final StorageBackend<String, Bucket> bucketStore;
     private final StorageBackend<String, S3Object> objectStore;
     private final Path dataRoot;
+    private final boolean inMemory;
+    private final ConcurrentHashMap<String, byte[]> memoryDataStore = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Map<Integer, byte[]>> memoryMultipartStore = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, MultipartUpload> multipartUploads = new ConcurrentHashMap<>();
 
     private final SqsService sqsService;
@@ -57,6 +61,7 @@ public class S3Service {
                         new TypeReference<Map<String, S3Object>>() {
                         }),
                 Path.of(config.storage().persistentPath()).resolve("s3"),
+                "memory".equals(config.storage().services().s3().mode().orElse(config.storage().mode())),
                 sqsService, snsService, regionResolver, config.effectiveBaseUrl(), objectMapper
         );
     }
@@ -66,27 +71,30 @@ public class S3Service {
      */
     S3Service(StorageBackend<String, Bucket> bucketStore,
               StorageBackend<String, S3Object> objectStore,
-              Path dataRoot) {
-        this(bucketStore, objectStore, dataRoot, null, null, null, "http://localhost:4566",
+              Path dataRoot, boolean inMemory) {
+        this(bucketStore, objectStore, dataRoot, inMemory, null, null, null, "http://localhost:4566",
                 new ObjectMapper());
     }
 
     private S3Service(StorageBackend<String, Bucket> bucketStore,
                       StorageBackend<String, S3Object> objectStore,
-                      Path dataRoot, SqsService sqsService, SnsService snsService,
+                      Path dataRoot, boolean inMemory, SqsService sqsService, SnsService snsService,
                       RegionResolver regionResolver, String baseUrl, ObjectMapper objectMapper) {
         this.bucketStore = bucketStore;
         this.objectStore = objectStore;
         this.dataRoot = dataRoot;
+        this.inMemory = inMemory;
         this.sqsService = sqsService;
         this.snsService = snsService;
         this.regionResolver = regionResolver;
         this.baseUrl = baseUrl;
         this.objectMapper = objectMapper;
-        try {
-            Files.createDirectories(dataRoot);
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to create S3 data directory: " + dataRoot, e);
+        if (!inMemory) {
+            try {
+                Files.createDirectories(dataRoot);
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to create S3 data directory: " + dataRoot, e);
+            }
         }
     }
 
@@ -115,7 +123,12 @@ public class S3Service {
         }
 
         bucketStore.delete(bucketName);
-        deleteDirectory(dataRoot.resolve(bucketName));
+        if (inMemory) {
+            String prefix = bucketName + "/";
+            memoryDataStore.keySet().removeIf(k -> k.startsWith(prefix));
+        } else {
+            deleteDirectory(dataRoot.resolve(bucketName));
+        }
         LOG.infov("Deleted bucket: {0}", bucketName);
     }
 
@@ -138,8 +151,16 @@ public class S3Service {
     public S3Object putObject(String bucketName, String key, byte[] data,
                               String contentType, Map<String, String> metadata, String storageClass,
                               String objectLockMode, Instant retainUntilDate, String legalHoldStatus) {
-        S3Object object = storeObject(bucketName, key, data, contentType, metadata, storageClass, null, null,
+        return putObject(bucketName, key, data, contentType, metadata, storageClass, null,
                 objectLockMode, retainUntilDate, legalHoldStatus);
+    }
+
+    public S3Object putObject(String bucketName, String key, byte[] data,
+                              String contentType, Map<String, String> metadata, String storageClass,
+                              String contentEncoding,
+                              String objectLockMode, Instant retainUntilDate, String legalHoldStatus) {
+        S3Object object = storeObject(bucketName, key, data, contentType, metadata, storageClass, null, null,
+                objectLockMode, retainUntilDate, legalHoldStatus, contentEncoding);
         fireNotifications(bucketName, key, "ObjectCreated:Put", object);
         return object;
     }
@@ -150,13 +171,22 @@ public class S3Service {
     private S3Object storeObject(String bucketName, String key, byte[] data,
                                  String contentType, Map<String, String> metadata) {
         return storeObject(bucketName, key, data, contentType, metadata, null, null, null,
-                null, null, null);
+                null, null, null, null);
     }
 
     private S3Object storeObject(String bucketName, String key, byte[] data,
                                  String contentType, Map<String, String> metadata, String storageClass,
                                  S3Checksum checksum, List<Part> parts,
                                  String objectLockMode, Instant retainUntilDate, String legalHoldStatus) {
+        return storeObject(bucketName, key, data, contentType, metadata, storageClass, checksum, parts,
+                objectLockMode, retainUntilDate, legalHoldStatus, null);
+    }
+
+    private S3Object storeObject(String bucketName, String key, byte[] data,
+                                 String contentType, Map<String, String> metadata, String storageClass,
+                                 S3Checksum checksum, List<Part> parts,
+                                 String objectLockMode, Instant retainUntilDate, String legalHoldStatus,
+                                 String contentEncoding) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket",
                         "The specified bucket does not exist.", 404));
@@ -168,6 +198,7 @@ public class S3Service {
         object.setStorageClass(ObjectAttributeName.normalizeStorageClass(storageClass));
         object.setChecksum(checksum != null ? copyChecksum(checksum) : buildChecksum(data, parts, false));
         object.setParts(copyParts(parts));
+        object.setContentEncoding(contentEncoding);
 
         if (bucket.isVersioningEnabled()) {
             String versionId = UUID.randomUUID().toString();
@@ -409,7 +440,13 @@ public class S3Service {
         }
     }
 
+    public record ListObjectsResult(List<S3Object> objects, List<String> commonPrefixes, boolean isTruncated) {}
+
     public List<S3Object> listObjects(String bucketName, String prefix, String delimiter, int maxKeys) {
+        return listObjectsWithPrefixes(bucketName, prefix, delimiter, maxKeys).objects();
+    }
+
+    public ListObjectsResult listObjectsWithPrefixes(String bucketName, String prefix, String delimiter, int maxKeys) {
         ensureBucketExists(bucketName);
 
         String keyPrefix = bucketName + "/";
@@ -423,21 +460,59 @@ public class S3Service {
                 .toList();
         allObjects = new ArrayList<>(allObjects);
 
+        // see https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-prefixes.html
+        List<String> commonPrefixes = List.of();
+
         if (delimiter != null && !delimiter.isEmpty()) {
-            // Filter to only return objects at this level (simulate directory listing)
-            allObjects = allObjects.stream()
-                    .filter(obj -> {
-                        String remainder = obj.getKey().substring(prefix != null ? prefix.length() : 0);
-                        return !remainder.contains(delimiter);
-                    })
-                    .toList();
+            Set<String> prefixSet = new LinkedHashSet<>();
+            List<S3Object> directObjects = new ArrayList<>();
+
+            for (S3Object obj : allObjects) {
+                String remainder = obj.getKey().substring(prefix != null ? prefix.length() : 0);
+                int delimIdx = remainder.indexOf(delimiter);
+                if (delimIdx >= 0) {
+                    String cp = (prefix != null ? prefix : "") + remainder.substring(0, delimIdx + delimiter.length());
+                    prefixSet.add(cp);
+                } else {
+                    directObjects.add(obj);
+                }
+            }
+
+            allObjects = directObjects;
+            commonPrefixes = new ArrayList<>(prefixSet);
+            Collections.sort(commonPrefixes);
         }
 
-        if (maxKeys > 0 && allObjects.size() > maxKeys) {
-            allObjects = allObjects.subList(0, maxKeys);
+        allObjects.sort(Comparator.comparing(S3Object::getKey));
+
+        // S3 counts both direct objects and common prefixes.
+        // Each common prefix group (e.g. "docs/") uses one entry regardless of
+        // how many keys it contains. Merge both sorted lists lexicographically
+        // and stop at maxKeys to try to match S3 ListObjectsV2 behavior.
+        // see https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html
+        boolean isTruncated = false;
+        if (maxKeys > 0) {
+            List<S3Object> limitedObjects = new ArrayList<>();
+            List<String> limitedPrefixes = new ArrayList<>();
+            int count = 0;
+            int directObjectCount = 0;
+            int commonPrefixCount = 0;
+            while (count < maxKeys && (directObjectCount < allObjects.size() || commonPrefixCount < commonPrefixes.size())) {
+                String objectKey = directObjectCount < allObjects.size() ? allObjects.get(directObjectCount).getKey() : null;
+                String prefixKey = commonPrefixCount < commonPrefixes.size() ? commonPrefixes.get(commonPrefixCount) : null;
+                if (objectKey != null && (prefixKey == null || objectKey.compareTo(prefixKey) <= 0)) {
+                    limitedObjects.add(allObjects.get(directObjectCount++));
+                } else {
+                    limitedPrefixes.add(commonPrefixes.get(commonPrefixCount++));
+                }
+                count++;
+            }
+            isTruncated = directObjectCount < allObjects.size() || commonPrefixCount < commonPrefixes.size();
+            allObjects = limitedObjects;
+            commonPrefixes = limitedPrefixes;
         }
 
-        return allObjects;
+        return new ListObjectsResult(allObjects, commonPrefixes, isTruncated);
     }
 
     public S3Object copyObject(String sourceBucket, String sourceKey,
@@ -450,6 +525,14 @@ public class S3Service {
                                String destBucket, String destKey,
                                String metadataDirective, Map<String, String> replacementMetadata,
                                String storageClass, String contentType) {
+        return copyObject(sourceBucket, sourceKey, destBucket, destKey, metadataDirective,
+                replacementMetadata, storageClass, contentType, null);
+    }
+
+    public S3Object copyObject(String sourceBucket, String sourceKey,
+                               String destBucket, String destKey,
+                               String metadataDirective, Map<String, String> replacementMetadata,
+                               String storageClass, String contentType, String contentEncoding) {
         S3Object source = getObject(sourceBucket, sourceKey);
         ensureBucketExists(destBucket);
 
@@ -461,8 +544,10 @@ public class S3Service {
 
         String effectiveContentType = replaceMetadata && contentType != null ? contentType : source.getContentType();
         String effectiveStorageClass = storageClass != null ? storageClass : source.getStorageClass();
+        String effectiveContentEncoding = replaceMetadata && contentEncoding != null ? contentEncoding : source.getContentEncoding();
         S3Object copy = storeObject(destBucket, destKey, source.getData(), effectiveContentType, metadata,
-                effectiveStorageClass, source.getChecksum(), source.getParts(), null, null, null);
+                effectiveStorageClass, source.getChecksum(), source.getParts(), null, null, null,
+                effectiveContentEncoding);
         copy.setETag(source.getETag());
         LOG.debugv("Copied object: {0}/{1} -> {2}/{3}", sourceBucket, sourceKey, destBucket, destKey);
         fireNotifications(destBucket, destKey, "ObjectCreated:Copy", copy);
@@ -729,10 +814,14 @@ public class S3Service {
         }
         upload.setStorageClass(ObjectAttributeName.normalizeStorageClass(storageClass));
 
-        try {
-            Files.createDirectories(dataRoot.resolve(".multipart").resolve(upload.getUploadId()));
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to create multipart temp directory", e);
+        if (inMemory) {
+            memoryMultipartStore.put(upload.getUploadId(), new ConcurrentHashMap<>());
+        } else {
+            try {
+                Files.createDirectories(dataRoot.resolve(".multipart").resolve(upload.getUploadId()));
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to create multipart temp directory", e);
+            }
         }
 
         multipartUploads.put(upload.getUploadId(), upload);
@@ -751,12 +840,15 @@ public class S3Service {
                     "Part number must be between 1 and 10000.", 400);
         }
 
-        // Write part to temp directory
-        Path partPath = dataRoot.resolve(".multipart").resolve(uploadId).resolve(String.valueOf(partNumber));
-        try {
-            Files.write(partPath, data);
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to write multipart part", e);
+        if (inMemory) {
+            memoryMultipartStore.get(uploadId).put(partNumber, data);
+        } else {
+            Path partPath = dataRoot.resolve(".multipart").resolve(uploadId).resolve(String.valueOf(partNumber));
+            try {
+                Files.write(partPath, data);
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to write multipart part", e);
+            }
         }
 
         String eTag = computeETag(data);
@@ -765,6 +857,26 @@ public class S3Service {
         upload.getParts().put(partNumber, part);
         LOG.debugv("Uploaded part {0} for upload {1} ({2} bytes)", partNumber, uploadId, data.length);
         return eTag;
+    }
+
+    public String uploadPartCopy(String destBucket, String destKey, String uploadId, int partNumber,
+                                  String sourceBucket, String sourceKey, String copySourceRange) {
+        S3Object source = getObject(sourceBucket, sourceKey);
+        byte[] data = source.getData();
+
+        if (copySourceRange != null && !copySourceRange.isBlank()) {
+            // format: "bytes=START-END" (inclusive on both ends)
+            String range = copySourceRange.startsWith("bytes=") ? copySourceRange.substring(6) : copySourceRange;
+            int dash = range.indexOf('-');
+            if (dash < 0) {
+                throw new AwsException("InvalidArgument", "Invalid x-amz-copy-source-range: " + copySourceRange, 400);
+            }
+            int start = Integer.parseInt(range.substring(0, dash).trim());
+            int end = Integer.parseInt(range.substring(dash + 1).trim());
+            data = Arrays.copyOfRange(data, start, end + 1);
+        }
+
+        return uploadPart(destBucket, destKey, uploadId, partNumber, data);
     }
 
     public S3Object completeMultipartUpload(String bucket, String key, String uploadId, List<Integer> partNumbers) {
@@ -788,8 +900,9 @@ public class S3Service {
             MessageDigest md = MessageDigest.getInstance("MD5");
 
             for (int num : partNumbers) {
-                Path partPath = dataRoot.resolve(".multipart").resolve(uploadId).resolve(String.valueOf(num));
-                byte[] partData = Files.readAllBytes(partPath);
+                byte[] partData = inMemory
+                        ? memoryMultipartStore.get(uploadId).get(num)
+                        : Files.readAllBytes(dataRoot.resolve(".multipart").resolve(uploadId).resolve(String.valueOf(num)));
                 combined.write(partData);
                 // For composite ETag: hash each part's MD5
                 md.update(computeETagBytes(partData));
@@ -838,6 +951,15 @@ public class S3Service {
         return multipartUploads.values().stream()
                 .filter(u -> u.getBucket().equals(bucket))
                 .toList();
+    }
+
+    public MultipartUpload listParts(String bucket, String key, String uploadId) {
+        MultipartUpload upload = multipartUploads.get(uploadId);
+        if (upload == null || !upload.getBucket().equals(bucket) || !upload.getKey().equals(key)) {
+            throw new AwsException("NoSuchUpload",
+                    "The specified multipart upload does not exist.", 404);
+        }
+        return upload;
     }
 
     // --- Notification Configuration ---
@@ -891,6 +1013,96 @@ public class S3Service {
             throw new AwsException("NoSuchCORSConfiguration", "The CORS configuration does not exist", 404);
         }
         return bucket.getCorsConfiguration();
+    }
+
+    public record CorsEvalResult(
+        String allowedOrigin,
+        List<String> allowedMethods,
+        List<String> allowedHeaders,
+        List<String> exposeHeaders,
+        int maxAgeSeconds
+    ) {}
+
+    /**
+     * Evaluates a CORS request (preflight or actual) against the bucket's CORS configuration.
+     *
+     * @param bucketName     the bucket to check
+     * @param origin         the Origin header value from the browser request
+     * @param requestMethod  the Access-Control-Request-Method (for preflight) or the HTTP method (for actual requests)
+     * @param requestHeaders the Access-Control-Request-Headers values (may be empty for actual requests)
+     * @return the matching CORS rule details, or empty if no rule matches
+     */
+    public Optional<CorsEvalResult> evaluateCors(String bucketName, String origin,
+                                                  String requestMethod, List<String> requestHeaders) {
+        Bucket bucket = bucketStore.get(bucketName).orElse(null);
+        if (bucket == null || bucket.getCorsConfiguration() == null) return Optional.empty();
+
+        String corsXml = bucket.getCorsConfiguration();
+        List<Map<String, List<String>>> rules = XmlParser.extractGroupsMulti(corsXml, "CORSRule");
+
+        for (Map<String, List<String>> rule : rules) {
+            List<String> allowedOrigins = rule.getOrDefault("AllowedOrigin", List.of());
+            List<String> allowedMethods = rule.getOrDefault("AllowedMethod", List.of());
+            List<String> allowedHeaders = rule.getOrDefault("AllowedHeader", List.of());
+            List<String> exposeHeaders  = rule.getOrDefault("ExposeHeader",  List.of());
+            List<String> maxAgeList     = rule.getOrDefault("MaxAgeSeconds", List.of());
+            int maxAge = 0;
+            if (!maxAgeList.isEmpty()) {
+                String maxAgeRaw = maxAgeList.get(0);
+                if (maxAgeRaw != null) {
+                    String trimmed = maxAgeRaw.trim();
+                    if (!trimmed.isEmpty()) {
+                        try {
+                            maxAge = Integer.parseInt(trimmed);
+                        } catch (NumberFormatException ignored) {
+                            // Treat invalid MaxAgeSeconds as no max-age (equivalent to 0)
+                        }
+                    }
+                }
+            }
+
+            boolean originMatches = allowedOrigins.contains("*")
+                || (origin != null && allowedOrigins.stream().anyMatch(ao -> matchesCorsOrigin(ao, origin)));
+            if (!originMatches) continue;
+
+            if (requestMethod != null
+                    && allowedMethods.stream().noneMatch(m -> m.equalsIgnoreCase(requestMethod))) continue;
+
+            if (requestHeaders != null && !requestHeaders.isEmpty()) {
+                boolean headersOk = allowedHeaders.contains("*")
+                    || requestHeaders.stream().allMatch(rh ->
+                        allowedHeaders.stream().anyMatch(ah -> ah.equalsIgnoreCase(rh)));
+                if (!headersOk) continue;
+            }
+
+            String echoOrigin = allowedOrigins.contains("*") ? "*" : origin;
+            return Optional.of(new CorsEvalResult(echoOrigin, allowedMethods, allowedHeaders, exposeHeaders, maxAge));
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Matches an AllowedOrigin pattern against a concrete Origin header value.
+     *
+     * <p>AWS S3 CORS allows at most one {@code *} wildcard anywhere in the pattern
+     * (e.g. {@code *}, {@code http://*.example.com}, {@code http://app-*.example.com}).
+     * The {@code *} matches zero or more characters at that position in the origin string.
+     * The concrete Origin is always treated as an exact scheme+host+port string.
+     */
+    private static boolean matchesCorsOrigin(String pattern, String origin) {
+        if ("*".equals(pattern)) return true;
+        int star = pattern.indexOf('*');
+        if (star < 0) {
+            return pattern.equals(origin);
+        }
+        // Single wildcard: split into prefix and suffix around the '*'
+        String prefix = pattern.substring(0, star);
+        String suffix = pattern.substring(star + 1);
+        // The wildcard may match zero or more characters, so the origin must be at
+        // least as long as prefix+suffix combined (no overlap allowed).
+        return origin.length() >= prefix.length() + suffix.length()
+                && origin.startsWith(prefix)
+                && origin.endsWith(suffix);
     }
 
     public void putBucketCors(String bucketName, String cors) {
@@ -1019,10 +1231,10 @@ public class S3Service {
         }
 
         String region = regionResolver != null ? regionResolver.getDefaultRegion() : "us-east-1";
-        String eventJson = buildS3EventJson(bucketName, key, eventName, obj, region);
+        String eventJson = buildS3EventJson(bucketName, key, eventName, obj, region, bucket.isVersioningEnabled());
 
         for (QueueNotification qn : config.getQueueConfigurations()) {
-            if (qn.events().stream().anyMatch(p -> matchesEvent(p, eventName))) {
+            if (qn.events().stream().anyMatch(p -> matchesEvent(p, eventName)) && qn.matchesKey(key)) {
                 try {
                     sqsService.sendMessage(sqsUrlFromArn(qn.queueArn()), eventJson, 0);
                     LOG.debugv("Fired S3 event {0} to SQS {1}", eventName, qn.queueArn());
@@ -1033,7 +1245,7 @@ public class S3Service {
         }
 
         for (TopicNotification tn : config.getTopicConfigurations()) {
-            if (tn.events().stream().anyMatch(p -> matchesEvent(p, eventName))) {
+            if (tn.events().stream().anyMatch(p -> matchesEvent(p, eventName)) && tn.matchesKey(key)) {
                 try {
                     snsService.publish(tn.topicArn(), null, eventJson, "Amazon S3 Notification", region);
                     LOG.debugv("Fired S3 event {0} to SNS {1}", eventName, tn.topicArn());
@@ -1058,7 +1270,7 @@ public class S3Service {
     }
 
     private String buildS3EventJson(String bucketName, String key, String eventName,
-                                    S3Object obj, String region) {
+                                    S3Object obj, String region, boolean isVersionEnabled) {
         try {
             String eventTime = DateTimeFormatter.ISO_INSTANT.format(Instant.now());
             long size = obj != null ? obj.getSize() : 0;
@@ -1073,7 +1285,10 @@ public class S3Service {
             objectNode.put("key", key);
             objectNode.put("size", size);
             objectNode.put("eTag", eTag);
-
+            if(isVersionEnabled) {
+                String versionId = obj !=null && obj.getVersionId()!=null ? obj.getVersionId() : "";
+                objectNode.put("versionId", versionId);
+            }
             ObjectNode s3Node = objectMapper.createObjectNode();
             s3Node.put("s3SchemaVersion", "1.0");
             s3Node.put("configurationId", "emulator");
@@ -1101,7 +1316,11 @@ public class S3Service {
 
     private void cleanupMultipart(String uploadId) {
         multipartUploads.remove(uploadId);
-        deleteDirectory(dataRoot.resolve(".multipart").resolve(uploadId));
+        if (inMemory) {
+            memoryMultipartStore.remove(uploadId);
+        } else {
+            deleteDirectory(dataRoot.resolve(".multipart").resolve(uploadId));
+        }
     }
 
     private static S3Checksum buildChecksum(byte[] data, List<Part> parts, boolean multipartUpload) {
@@ -1121,6 +1340,7 @@ public class S3Service {
         copy.setData(source.getData() != null ? Arrays.copyOf(source.getData(), source.getData().length) : null);
         copy.setMetadata(new HashMap<>(source.getMetadata()));
         copy.setContentType(source.getContentType());
+        copy.setContentEncoding(source.getContentEncoding());
         copy.setSize(source.getSize());
         copy.setLastModified(source.getLastModified());
         copy.setETag(source.getETag());
@@ -1207,15 +1427,21 @@ public class S3Service {
         return bucketName + "/" + key + "#v#" + versionId;
     }
 
+    private static final String DATA_SUFFIX = ".s3data";
+
     private Path resolveObjectPath(String bucketName, String key) {
-        return dataRoot.resolve(bucketName).resolve(key);
+        return dataRoot.resolve(bucketName).resolve(key + DATA_SUFFIX);
     }
 
     private Path resolveVersionedPath(String bucketName, String key, String versionId) {
-        return dataRoot.resolve(".versions").resolve(bucketName).resolve(key).resolve(versionId);
+        return dataRoot.resolve(".versions").resolve(bucketName).resolve(key).resolve(versionId + DATA_SUFFIX);
     }
 
     private void writeVersionedFile(String bucketName, String key, String versionId, byte[] data) {
+        if (inMemory) {
+            memoryDataStore.put(versionedKey(bucketName, key, versionId), data);
+            return;
+        }
         try {
             Path filePath = resolveVersionedPath(bucketName, key, versionId);
             Files.createDirectories(filePath.getParent());
@@ -1226,6 +1452,9 @@ public class S3Service {
     }
 
     private byte[] readVersionedFile(String bucketName, String key, String versionId) {
+        if (inMemory) {
+            return memoryDataStore.get(versionedKey(bucketName, key, versionId));
+        }
         try {
             return Files.readAllBytes(resolveVersionedPath(bucketName, key, versionId));
         } catch (IOException e) {
@@ -1234,6 +1463,10 @@ public class S3Service {
     }
 
     private void writeFile(String bucketName, String key, byte[] data) {
+        if (inMemory) {
+            memoryDataStore.put(objectKey(bucketName, key), data);
+            return;
+        }
         try {
             Path filePath = resolveObjectPath(bucketName, key);
             Files.createDirectories(filePath.getParent());
@@ -1244,6 +1477,9 @@ public class S3Service {
     }
 
     private byte[] readFile(String bucketName, String key) {
+        if (inMemory) {
+            return memoryDataStore.get(objectKey(bucketName, key));
+        }
         try {
             return Files.readAllBytes(resolveObjectPath(bucketName, key));
         } catch (IOException e) {
@@ -1252,6 +1488,10 @@ public class S3Service {
     }
 
     private void deleteFile(String bucketName, String key) {
+        if (inMemory) {
+            memoryDataStore.remove(objectKey(bucketName, key));
+            return;
+        }
         try {
             Files.deleteIfExists(resolveObjectPath(bucketName, key));
         } catch (IOException e) {

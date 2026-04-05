@@ -1,6 +1,6 @@
 # Services Overview
 
-Floci emulates 21+ AWS services on a single port (`4566`). All services use the real AWS wire protocol — your existing AWS CLI commands and SDK clients work without modification.
+Floci emulates 26 AWS services on a single port (`4566`). All services use the real AWS wire protocol — your existing AWS CLI commands and SDK clients work without modification.
 
 ## Service Matrix
 
@@ -9,6 +9,7 @@ Floci emulates 21+ AWS services on a single port (`4566`). All services use the 
 | [SSM](ssm.md) | `POST /` + `X-Amz-Target: AmazonSSM.*` | JSON 1.1 | 12 |
 | [SQS](sqs.md) | `POST /` with `Action=` param | Query / JSON | 20 |
 | [SNS](sns.md) | `POST /` with `Action=` param | Query / JSON | 17 |
+| [SES](ses.md) | `POST /` with `Action=` param | Query | 16 |
 | [S3](s3.md) | `/{bucket}/{key}` | REST XML | 50+ |
 | [DynamoDB](dynamodb.md) | `POST /` + `X-Amz-Target: DynamoDB_20120810.*` | JSON 1.1 | 19 |
 | [DynamoDB Streams](dynamodb.md#streams) | `POST /` + `X-Amz-Target: DynamoDBStreams_20120810.*` | JSON 1.1 | 4 |
@@ -29,6 +30,9 @@ Floci emulates 21+ AWS services on a single port (`4566`). All services use the 
 | [CloudWatch Logs](cloudwatch.md) | `POST /` + `X-Amz-Target: Logs.*` | JSON 1.1 | 14 |
 | [CloudWatch Metrics](cloudwatch.md#metrics) | `POST /` with `Action=` or JSON 1.1 | Query / JSON | 8 |
 | [ACM](acm.md) | `POST /` + `X-Amz-Target: CertificateManager.*` | JSON 1.1 | 12 |
+| [ECS](ecs.md) | `POST /` + `X-Amz-Target: AmazonEC2ContainerServiceV20141113.*` | JSON 1.1 | 58 |
+| [SES](ses.md) | `POST /` with `Action=` param | Query | 14 |
+| [OpenSearch](opensearch.md) | `/2021-01-01/opensearch/...` | REST JSON | 24 |
 
 ## Common Setup
 

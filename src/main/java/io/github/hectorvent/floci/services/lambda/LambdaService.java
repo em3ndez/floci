@@ -23,6 +23,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -262,6 +263,11 @@ public class LambdaService {
         int batchSize = toInt(request.get("BatchSize"), 10);
         boolean enabled = !Boolean.FALSE.equals(request.get("Enabled"));
 
+        @SuppressWarnings("unchecked")
+        List<String> functionResponseTypes = request.get("FunctionResponseTypes") instanceof List
+                ? (List<String>) request.get("FunctionResponseTypes")
+                : new ArrayList<>();
+
         String queueUrl = eventSourceArn.contains(":sqs:") ? AwsArnUtils.arnToQueueUrl(eventSourceArn, config.effectiveBaseUrl()) : null;
 
         EventSourceMapping esm = new EventSourceMapping();
@@ -274,6 +280,7 @@ public class LambdaService {
         esm.setBatchSize(batchSize);
         esm.setEnabled(enabled);
         esm.setState(enabled ? "Enabled" : "Disabled");
+        esm.setFunctionResponseTypes(functionResponseTypes);
         esm.setLastModified(System.currentTimeMillis());
 
         esmStore.save(esm);
@@ -359,6 +366,7 @@ public class LambdaService {
         int version = versionCounters.merge(region + "::" + functionName, 1, Integer::sum);
         LambdaFunction snapshot = new LambdaFunction();
         snapshot.setFunctionName(fn.getFunctionName());
+        snapshot.setVersion(String.valueOf(version));
         snapshot.setFunctionArn(fn.getFunctionArn().replace(":$LATEST", "") + ":" + version);
         snapshot.setRuntime(fn.getRuntime());
         snapshot.setRole(fn.getRole());
@@ -372,7 +380,15 @@ public class LambdaService {
         snapshot.setEnvironment(fn.getEnvironment());
         snapshot.setLastModified(System.currentTimeMillis());
         snapshot.setRevisionId(UUID.randomUUID().toString());
+        
+        functionStore.save(region, snapshot);
+        LOG.infov("Published version {0} for function {1}", version, functionName);
         return snapshot;
+    }
+
+    public List<LambdaFunction> listVersionsByFunction(String region, String functionName) {
+        getFunction(region, functionName); // verify function exists
+        return functionStore.listVersions(region, functionName);
     }
 
     // ──────────────────────────── Aliases ────────────────────────────

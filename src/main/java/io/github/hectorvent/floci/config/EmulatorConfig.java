@@ -38,11 +38,19 @@ public interface EmulatorConfig {
     @WithDefault("000000000000")
     String defaultAccountId();
 
+    @WithDefault("512")
+    int maxRequestSize();
+
+    @WithDefault("public.ecr.aws")
+    String ecrBaseUri();
+
     StorageConfig storage();
 
     AuthConfig auth();
 
     ServicesConfig services();
+
+    InitHooksConfig initHooks();
 
     interface StorageConfig {
         @WithDefault("hybrid")
@@ -67,77 +75,75 @@ public interface EmulatorConfig {
         CloudWatchMetricsStorageConfig cloudwatchmetrics();
         SecretsManagerStorageConfig secretsmanager();
         AcmStorageConfig acm();
+        OpenSearchStorageConfig opensearch();
     }
 
     interface SsmStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface SqsStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
     }
 
     interface S3StorageConfig {
-        @WithDefault("hybrid")
-        String mode();
+        Optional<String> mode();
     }
 
     interface DynamoDbStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface SnsStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface LambdaStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface CloudWatchLogsStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface CloudWatchMetricsStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface SecretsManagerStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface AcmStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
+    interface OpenSearchStorageConfig {
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
@@ -183,6 +189,8 @@ public interface EmulatorConfig {
         CloudFormationServiceConfig cloudformation();
         AcmServiceConfig acm();
         SesServiceConfig ses();
+        OpenSearchServiceConfig opensearch();
+        EcsServiceConfig ecs();
     }
 
     interface SsmServiceConfig {
@@ -342,6 +350,42 @@ public interface EmulatorConfig {
         boolean enabled();
     }
 
+    interface OpenSearchServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        @WithDefault("mock")
+        String mode();
+
+        @WithDefault("opensearchproject/opensearch:2")
+        String defaultImage();
+
+        @WithDefault("9400")
+        int proxyBasePort();
+
+        @WithDefault("9499")
+        int proxyMaxPort();
+
+        Optional<String> dockerNetwork();
+    }
+
+    interface EcsServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /** When true, tasks go straight to RUNNING without starting real Docker containers. */
+        @WithDefault("false")
+        boolean mock();
+
+        Optional<String> dockerNetwork();
+
+        @WithDefault("512")
+        int defaultMemoryMb();
+
+        @WithDefault("256")
+        int defaultCpuUnits();
+    }
+
     interface LambdaServiceConfig {
         @WithDefault("true")
         boolean enabled();
@@ -377,5 +421,16 @@ public interface EmulatorConfig {
 
         /** Docker network to attach Lambda containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();
+    }
+
+    interface InitHooksConfig {
+        @WithDefault("/bin/bash")
+        String shellExecutable();
+
+        @WithDefault("2")
+        long shutdownGracePeriodSeconds();
+
+        @WithDefault("30")
+        long timeoutSeconds();
     }
 }

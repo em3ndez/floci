@@ -9,9 +9,23 @@ data/
 .project
 .classpath
 .vscode/
+.zed/settings.json
 .DS_Store
+.zed/settings.json
+.kiro/
 
 CLAUDE.md
+GEMINI.md
+COPILOT.md
 .claude
 
 posts
+local
+
+.terraform.lock.hcl
+go.sum
+package-lock.json
+test-results.xml
+
+*.log
+

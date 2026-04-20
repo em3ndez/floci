@@ -5,12 +5,21 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.kms.model.KmsAlias;
 import io.github.hectorvent.floci.services.kms.model.KmsKey;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.security.Security;
+import java.security.KeyFactory;
+import java.security.PublicKey;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -19,6 +28,13 @@ class KmsServiceTest {
     private static final String REGION = "us-east-1";
 
     private KmsService kmsService;
+
+    @BeforeAll
+    static void registerBouncyCastle() {
+        if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
+            Security.addProvider(new BouncyCastleProvider());
+        }
+    }
 
     @BeforeEach
     void setUp() {
@@ -127,11 +143,48 @@ class KmsServiceTest {
     }
 
     @Test
-    void encryptAndDecrypt() {
+    void encryptAndDecryptWithId() {
         KmsKey key = kmsService.createKey(null, REGION);
         byte[] plaintext = "hello world".getBytes(StandardCharsets.UTF_8);
 
         byte[] ciphertext = kmsService.encrypt(key.getKeyId(), plaintext, REGION);
+        byte[] decrypted = kmsService.decrypt(ciphertext, REGION);
+
+        assertArrayEquals(plaintext, decrypted);
+    }
+
+    @Test
+    void encryptAndDecryptWithArn() {
+        KmsKey key = kmsService.createKey(null, REGION);
+        byte[] plaintext = "hello world".getBytes(StandardCharsets.UTF_8);
+
+        byte[] ciphertext = kmsService.encrypt(key.getArn(), plaintext, REGION);
+        byte[] decrypted = kmsService.decrypt(ciphertext, REGION);
+
+        assertArrayEquals(plaintext, decrypted);
+    }
+
+    @Test
+    void encryptAndDecryptWithAliasName() {
+        KmsKey key = kmsService.createKey(null, REGION);
+        String aliasName = "alias/my-alias";
+        kmsService.createAlias(aliasName, key.getKeyId(), REGION);
+        byte[] plaintext = "hello world".getBytes(StandardCharsets.UTF_8);
+
+        byte[] ciphertext = kmsService.encrypt(aliasName, plaintext, REGION);
+        byte[] decrypted = kmsService.decrypt(ciphertext, REGION);
+
+        assertArrayEquals(plaintext, decrypted);
+    }
+
+    @Test
+    void encryptAndDecryptWithAliasArn() {
+        KmsKey key = kmsService.createKey(null, REGION);
+        String aliasName = "alias/my-alias";
+        kmsService.createAlias(aliasName, key.getKeyId(), REGION);
+        byte[] plaintext = "hello world".getBytes(StandardCharsets.UTF_8);
+
+        byte[] ciphertext = kmsService.encrypt("arn:aws:kms:" + REGION + ":000000000000:" + aliasName, plaintext, REGION);
         byte[] decrypted = kmsService.decrypt(ciphertext, REGION);
 
         assertArrayEquals(plaintext, decrypted);
@@ -143,23 +196,48 @@ class KmsServiceTest {
                 kmsService.decrypt("not-valid-ciphertext".getBytes(StandardCharsets.UTF_8), REGION));
     }
 
-    @Test
-    void signAndVerify() {
-        KmsKey key = kmsService.createKey(null, REGION);
+    @ParameterizedTest
+    @ValueSource(strings = {"ECC_NIST_P256", "ECC_NIST_P384", "ECC_NIST_P521", "ECC_SECG_P256K1"})
+    void signAndVerify(String keySpec) {
+        KmsKey key = kmsService.createKey("ecdsa key", "SIGN_VERIFY", keySpec, null, Map.of(), REGION);
         byte[] message = "sign me".getBytes(StandardCharsets.UTF_8);
 
-        byte[] sig = kmsService.sign(key.getKeyId(), message, "RSASSA_PSS_SHA_256", REGION);
-        assertTrue(kmsService.verify(key.getKeyId(), message, sig, "RSASSA_PSS_SHA_256", REGION));
+        byte[] sig = kmsService.sign(key.getKeyId(), message, "ECDSA_SHA_256", REGION);
+        assertNotNull(sig);
+        assertTrue(kmsService.verify(key.getKeyId(), message, sig, "ECDSA_SHA_256", REGION));
+    }
+
+    @Test
+    void signAndVerifyWithRsa() {
+        KmsKey key = kmsService.createKey("rsa key", "SIGN_VERIFY", "RSA_2048", null, Map.of(), REGION);
+        byte[] message = "sign me".getBytes(StandardCharsets.UTF_8);
+
+        byte[] sig = kmsService.sign(key.getKeyId(), message, "RSASSA_PKCS1_V1_5_SHA_256", REGION);
+        assertNotNull(sig);
+        assertTrue(kmsService.verify(key.getKeyId(), message, sig, "RSASSA_PKCS1_V1_5_SHA_256", REGION));
     }
 
     @Test
     void verifyWithWrongSignatureReturnsFalse() {
-        KmsKey key = kmsService.createKey(null, REGION);
+        KmsKey key = kmsService.createKey("ecdsa key", "SIGN_VERIFY", "ECC_NIST_P256", null, Map.of(), REGION);
         byte[] message = "sign me".getBytes(StandardCharsets.UTF_8);
 
-        kmsService.sign(key.getKeyId(), message, "RSASSA_PSS_SHA_256", REGION);
         assertFalse(kmsService.verify(key.getKeyId(), message,
-                "wrong-sig".getBytes(StandardCharsets.UTF_8), "RSASSA_PSS_SHA_256", REGION));
+                "not-a-valid-sig".getBytes(StandardCharsets.UTF_8), "ECDSA_SHA_256", REGION));
+    }
+
+    @Test
+    void getPublicKeyReturnsValidDerBytes() throws Exception {
+        KmsKey key = kmsService.createKey("ecdsa key", "SIGN_VERIFY", "ECC_NIST_P256", null, Map.of(), REGION);
+        KmsKey publicKeyInfo = kmsService.getPublicKey(key.getKeyId(), REGION);
+
+        assertNotNull(publicKeyInfo.getPublicKeyEncoded());
+        byte[] derBytes = Base64.getDecoder().decode(publicKeyInfo.getPublicKeyEncoded());
+        
+        // Verify it can be parsed as a standard Java PublicKey
+        KeyFactory factory = KeyFactory.getInstance("EC");
+        PublicKey pub = factory.generatePublic(new X509EncodedKeySpec(derBytes));
+        assertNotNull(pub);
     }
 
     @Test
@@ -191,5 +269,102 @@ class KmsServiceTest {
         KmsKey updated = kmsService.describeKey(key.getKeyId(), REGION);
         assertFalse(updated.getTags().containsKey("env"));
         assertTrue(updated.getTags().containsKey("team"));
+    }
+
+    // ── Issue #269 — CreateKey with Tags ────────────────────────────────────
+
+    @Test
+    void createKeyWithTagsStoresTags() {
+        KmsKey key = kmsService.createKey("tagged-key", null, Map.of("env", "prod", "team", "platform"), REGION);
+
+        KmsKey found = kmsService.describeKey(key.getKeyId(), REGION);
+        assertEquals("prod", found.getTags().get("env"));
+        assertEquals("platform", found.getTags().get("team"));
+    }
+
+    @Test
+    void createKeyWithoutTagsHasEmptyTagMap() {
+        KmsKey key = kmsService.createKey(null, REGION);
+        assertTrue(key.getTags().isEmpty());
+    }
+
+    // ── Issue #258 — GetKeyPolicy ────────────────────────────────────────────
+
+    @Test
+    void createKeyWithoutPolicyHasDefaultPolicy() {
+        KmsKey key = kmsService.createKey(null, REGION);
+        Map<String, Object> result = kmsService.getKeyPolicy(key.getKeyId(), REGION);
+
+        assertNotNull(result.get("Policy"));
+        assertEquals("default", result.get("PolicyName"));
+        assertTrue(((String) result.get("Policy")).contains("kms:*"));
+    }
+
+    @Test
+    void createKeyWithPolicyStoresPolicy() {
+        String customPolicy = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+        KmsKey key = kmsService.createKey("policy-key", customPolicy, Map.of(), REGION);
+
+        Map<String, Object> result = kmsService.getKeyPolicy(key.getKeyId(), REGION);
+        assertEquals(customPolicy, result.get("Policy"));
+        assertEquals("default", result.get("PolicyName"));
+    }
+
+    // ── Issue #259 — PutKeyPolicy ────────────────────────────────────────────
+
+    @Test
+    void putKeyPolicyUpdatesPolicy() {
+        KmsKey key = kmsService.createKey(null, REGION);
+        String newPolicy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\"}]}";
+
+        kmsService.putKeyPolicy(key.getKeyId(), newPolicy, REGION);
+
+        Map<String, Object> result = kmsService.getKeyPolicy(key.getKeyId(), REGION);
+        assertEquals(newPolicy, result.get("Policy"));
+    }
+
+    @Test
+    void putKeyPolicyOnNonExistentKeyThrows() {
+        assertThrows(AwsException.class, () ->
+                kmsService.putKeyPolicy("non-existent", "{}", REGION));
+    }
+
+    // ── Issue #290 — Key Rotation ───────────────────────────────────────────
+
+    @Test
+    void getKeyRotationStatusDefaultFalse() {
+        KmsKey key = kmsService.createKey(null, REGION);
+        assertFalse(kmsService.getKeyRotationStatus(key.getKeyId(), REGION));
+    }
+
+    @Test
+    void enableAndGetKeyRotationStatus() {
+        KmsKey key = kmsService.createKey(null, REGION);
+        kmsService.enableKeyRotation(key.getKeyId(), REGION);
+        assertTrue(kmsService.getKeyRotationStatus(key.getKeyId(), REGION));
+    }
+
+    @Test
+    void disableKeyRotationAfterEnable() {
+        KmsKey key = kmsService.createKey(null, REGION);
+        kmsService.enableKeyRotation(key.getKeyId(), REGION);
+        kmsService.disableKeyRotation(key.getKeyId(), REGION);
+        assertFalse(kmsService.getKeyRotationStatus(key.getKeyId(), REGION));
+    }
+
+    @Test
+    void keyRotationOnNonExistentKeyThrows() {
+        assertThrows(AwsException.class, () ->
+                kmsService.getKeyRotationStatus("non-existent", REGION));
+    }
+
+    @Test
+    void keyRotationOnAsymmetricKeyThrows() {
+        KmsKey key = kmsService.createKey(null, REGION);
+        key.setCustomerMasterKeySpec("RSA_2048");
+        key.setKeyUsage("SIGN_VERIFY");
+        // Persist the modified key
+        assertThrows(AwsException.class, () ->
+                kmsService.enableKeyRotation(key.getKeyId(), REGION));
     }
 }

@@ -8,8 +8,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
+import io.github.hectorvent.floci.services.apigatewayv2.model.Authorizer;
+import io.github.hectorvent.floci.services.apigatewayv2.model.Deployment;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Integration;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Route;
+import io.github.hectorvent.floci.services.apigatewayv2.model.Stage;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.Context;
@@ -121,7 +124,7 @@ public class ApiGatewayController {
     @Path("/restapis/{apiId}/authorizers")
     public Response getAuthorizers(@Context HttpHeaders headers, @PathParam("apiId") String apiId) {
         String region = regionResolver.resolveRegion(headers);
-        List<Authorizer> auths = service.getAuthorizers(region, apiId);
+        List<io.github.hectorvent.floci.services.apigateway.model.Authorizer> auths = service.getAuthorizers(region, apiId);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("item");
         auths.forEach(a -> items.add(toAuthorizerNode(a)));
@@ -141,7 +144,7 @@ public class ApiGatewayController {
     @Path("/restapis/{apiId}/stages")
     public Response getStages(@Context HttpHeaders headers, @PathParam("apiId") String apiId) {
         String region = regionResolver.resolveRegion(headers);
-        List<Stage> stages = service.getStages(region, apiId);
+        List<io.github.hectorvent.floci.services.apigateway.model.Stage> stages = service.getStages(region, apiId);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("item");
         stages.forEach(s -> items.add(toStageNode(s)));
@@ -152,8 +155,14 @@ public class ApiGatewayController {
 
     @POST
     @Path("/restapis")
-    public Response createRestApi(@Context HttpHeaders headers, String body) {
+    public Response createRestApi(@Context HttpHeaders headers,
+                                  @QueryParam("mode") String mode,
+                                  String body) {
         String region = regionResolver.resolveRegion(headers);
+        if ("import".equals(mode)) {
+            RestApi api = service.importRestApi(region, body);
+            return Response.status(201).entity(toApiNode(api).toString()).type(MediaType.APPLICATION_JSON).build();
+        }
         try {
             @SuppressWarnings("unchecked")
             Map<String, Object> request = objectMapper.readValue(body, Map.class);
@@ -162,6 +171,17 @@ public class ApiGatewayController {
         } catch (IOException e) {
             throw new AwsException("BadRequestException", e.getMessage(), 400);
         }
+    }
+
+    @PUT
+    @Path("/restapis/{apiId}")
+    public Response putRestApi(@Context HttpHeaders headers,
+                               @PathParam("apiId") String apiId,
+                               @QueryParam("mode") String mode,
+                               String body) {
+        String region = regionResolver.resolveRegion(headers);
+        RestApi api = service.putRestApi(region, apiId, mode, body);
+        return Response.ok(toApiNode(api).toString()).type(MediaType.APPLICATION_JSON).build();
     }
 
     @GET
@@ -403,7 +423,7 @@ public class ApiGatewayController {
         try {
             @SuppressWarnings("unchecked")
             Map<String, Object> request = objectMapper.readValue(body, Map.class);
-            Deployment deployment = service.createDeployment(region, apiId, request);
+            io.github.hectorvent.floci.services.apigateway.model.Deployment deployment = service.createDeployment(region, apiId, request);
             return Response.status(201).entity(toDeploymentNode(deployment).toString()).type(MediaType.APPLICATION_JSON).build();
         } catch (IOException e) {
             throw new AwsException("BadRequestException", e.getMessage(), 400);
@@ -415,7 +435,7 @@ public class ApiGatewayController {
     public Response getDeployments(@Context HttpHeaders headers,
                                    @PathParam("apiId") String apiId) {
         String region = regionResolver.resolveRegion(headers);
-        List<Deployment> deployments = service.getDeployments(region, apiId);
+        List<io.github.hectorvent.floci.services.apigateway.model.Deployment> deployments = service.getDeployments(region, apiId);
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode items = root.putArray("item");
         deployments.forEach(d -> items.add(toDeploymentNode(d)));
@@ -431,7 +451,7 @@ public class ApiGatewayController {
         try {
             @SuppressWarnings("unchecked")
             Map<String, Object> request = objectMapper.readValue(body, Map.class);
-            Stage stage = service.createStage(region, apiId, request);
+            io.github.hectorvent.floci.services.apigateway.model.Stage stage = service.createStage(region, apiId, request);
             return Response.status(201).entity(toStageNode(stage).toString()).type(MediaType.APPLICATION_JSON).build();
         } catch (IOException e) {
             throw new AwsException("BadRequestException", e.getMessage(), 400);
@@ -449,7 +469,7 @@ public class ApiGatewayController {
             com.fasterxml.jackson.databind.JsonNode node = objectMapper.readTree(body).path("patchOperations");
             @SuppressWarnings("unchecked")
             List<Map<String, String>> patchOperations = objectMapper.convertValue(node, List.class);
-            Stage stage = service.updateStage(region, apiId, stageName, patchOperations);
+            io.github.hectorvent.floci.services.apigateway.model.Stage stage = service.updateStage(region, apiId, stageName, patchOperations);
             return Response.ok(toStageNode(stage).toString()).type(MediaType.APPLICATION_JSON).build();
         } catch (IOException e) {
             throw new AwsException("BadRequestException", e.getMessage(), 400);
@@ -477,7 +497,7 @@ public class ApiGatewayController {
         try {
             @SuppressWarnings("unchecked")
             Map<String, Object> request = objectMapper.readValue(body, Map.class);
-            Authorizer auth = service.createAuthorizer(region, apiId, request);
+            io.github.hectorvent.floci.services.apigateway.model.Authorizer auth = service.createAuthorizer(region, apiId, request);
             return Response.status(201).entity(toAuthorizerNode(auth).toString()).type(MediaType.APPLICATION_JSON).build();
         } catch (IOException e) {
             throw new AwsException("BadRequestException", e.getMessage(), 400);
@@ -625,6 +645,52 @@ public class ApiGatewayController {
                                            @PathParam("validatorId") String validatorId) {
         String region = regionResolver.resolveRegion(headers);
         service.deleteRequestValidator(region, apiId, validatorId);
+        return Response.accepted().build();
+    }
+
+    // ──────────────────────────── Models (v1) ────────────────────────────
+
+    @POST
+    @Path("/restapis/{apiId}/models")
+    public Response createModel(@Context HttpHeaders headers, @PathParam("apiId") String apiId, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> request = objectMapper.readValue(body, Map.class);
+            io.github.hectorvent.floci.services.apigateway.model.Model model = service.createModel(region, apiId, request);
+            return Response.status(201).entity(toModelNode(model).toString()).type(MediaType.APPLICATION_JSON).build();
+        } catch (IOException e) {
+            throw new AwsException("BadRequestException", e.getMessage(), 400);
+        }
+    }
+
+    @GET
+    @Path("/restapis/{apiId}/models")
+    public Response getModels(@Context HttpHeaders headers, @PathParam("apiId") String apiId) {
+        String region = regionResolver.resolveRegion(headers);
+        List<io.github.hectorvent.floci.services.apigateway.model.Model> models = service.getModels(region, apiId);
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode items = root.putArray("item");
+        models.forEach(m -> items.add(toModelNode(m)));
+        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/restapis/{apiId}/models/{modelName}")
+    public Response getModel(@Context HttpHeaders headers,
+                             @PathParam("apiId") String apiId,
+                             @PathParam("modelName") String modelName) {
+        String region = regionResolver.resolveRegion(headers);
+        return Response.ok(toModelNode(service.getModel(region, apiId, modelName)).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @DELETE
+    @Path("/restapis/{apiId}/models/{modelName}")
+    public Response deleteModel(@Context HttpHeaders headers,
+                                @PathParam("apiId") String apiId,
+                                @PathParam("modelName") String modelName) {
+        String region = regionResolver.resolveRegion(headers);
+        service.deleteModel(region, apiId, modelName);
         return Response.accepted().build();
     }
 
@@ -779,6 +845,21 @@ public class ApiGatewayController {
         return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
     }
 
+    @GET
+    @Path("/v2/apis/{apiId}/routes/{routeId}")
+    public Response getRoute(@Context HttpHeaders headers, @PathParam("apiId") String apiId, @PathParam("routeId") String routeId) {
+        String region = regionResolver.resolveRegion(headers);
+        return Response.ok(toV2RouteNode(v2Service.getRoute(region, apiId, routeId)).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @DELETE
+    @Path("/v2/apis/{apiId}/routes/{routeId}")
+    public Response deleteRoute(@Context HttpHeaders headers, @PathParam("apiId") String apiId, @PathParam("routeId") String routeId) {
+        String region = regionResolver.resolveRegion(headers);
+        v2Service.deleteRoute(region, apiId, routeId);
+        return Response.noContent().build();
+    }
+
     @POST
     @Path("/v2/apis/{apiId}/integrations")
     public Response createIntegration(@Context HttpHeaders headers, @PathParam("apiId") String apiId, String body) {
@@ -804,18 +885,139 @@ public class ApiGatewayController {
         return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
     }
 
-    // ──────────────────────────── Tags ────────────────────────────
+    @GET
+    @Path("/v2/apis/{apiId}/integrations/{integrationId}")
+    public Response getIntegration(@Context HttpHeaders headers, @PathParam("apiId") String apiId, @PathParam("integrationId") String integrationId) {
+        String region = regionResolver.resolveRegion(headers);
+        return Response.ok(toV2IntegrationNode(v2Service.getIntegration(region, apiId, integrationId)).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @DELETE
+    @Path("/v2/apis/{apiId}/integrations/{integrationId}")
+    public Response deleteIntegration(@Context HttpHeaders headers, @PathParam("apiId") String apiId, @PathParam("integrationId") String integrationId) {
+        String region = regionResolver.resolveRegion(headers);
+        v2Service.deleteIntegration(region, apiId, integrationId);
+        return Response.noContent().build();
+    }
+
+    @POST
+    @Path("/v2/apis/{apiId}/authorizers")
+    public Response createV2Authorizer(@Context HttpHeaders headers, @PathParam("apiId") String apiId, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> request = objectMapper.readValue(body, Map.class);
+            Authorizer authorizer = v2Service.createAuthorizer(region, apiId, request);
+            return Response.status(201).entity(toV2AuthorizerNode(authorizer).toString()).type(MediaType.APPLICATION_JSON).build();
+        } catch (IOException e) {
+            throw new AwsException("BadRequestException", e.getMessage(), 400);
+        }
+    }
 
     @GET
-    @Path("/tags/{arn: .*}")
-    public Response getTags(@Context HttpHeaders headers, @PathParam("arn") String arn) {
+    @Path("/v2/apis/{apiId}/authorizers")
+    public Response getV2Authorizers(@Context HttpHeaders headers, @PathParam("apiId") String apiId) {
         String region = regionResolver.resolveRegion(headers);
-        String apiId = apiIdFromArn(arn);
-        Map<String, String> tags = service.getTags(region, apiId);
+        List<Authorizer> authorizers = v2Service.getAuthorizers(region, apiId);
         ObjectNode root = objectMapper.createObjectNode();
-        ObjectNode tagsNode = root.putObject("tags");
-        tags.forEach(tagsNode::put);
+        ArrayNode items = root.putArray("items");
+        authorizers.forEach(a -> items.add(toV2AuthorizerNode(a)));
         return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/v2/apis/{apiId}/authorizers/{authorizerId}")
+    public Response getV2Authorizer(@Context HttpHeaders headers, @PathParam("apiId") String apiId, @PathParam("authorizerId") String authorizerId) {
+        String region = regionResolver.resolveRegion(headers);
+        return Response.ok(toV2AuthorizerNode(v2Service.getAuthorizer(region, apiId, authorizerId)).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @DELETE
+    @Path("/v2/apis/{apiId}/authorizers/{authorizerId}")
+    public Response deleteV2Authorizer(@Context HttpHeaders headers, @PathParam("apiId") String apiId, @PathParam("authorizerId") String authorizerId) {
+        String region = regionResolver.resolveRegion(headers);
+        v2Service.deleteAuthorizer(region, apiId, authorizerId);
+        return Response.noContent().build();
+    }
+
+    @POST
+    @Path("/v2/apis/{apiId}/stages")
+    public Response createV2Stage(@Context HttpHeaders headers, @PathParam("apiId") String apiId, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> request = objectMapper.readValue(body, Map.class);
+            Stage stage = v2Service.createStage(region, apiId, request);
+            return Response.status(201).entity(toV2StageNode(stage).toString()).type(MediaType.APPLICATION_JSON).build();
+        } catch (IOException e) {
+            throw new AwsException("BadRequestException", e.getMessage(), 400);
+        }
+    }
+
+    @GET
+    @Path("/v2/apis/{apiId}/stages")
+    public Response getV2Stages(@Context HttpHeaders headers, @PathParam("apiId") String apiId) {
+        String region = regionResolver.resolveRegion(headers);
+        List<Stage> stages = v2Service.getStages(region, apiId);
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode items = root.putArray("items");
+        stages.forEach(s -> items.add(toV2StageNode(s)));
+        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/v2/apis/{apiId}/stages/{stageName}")
+    public Response getV2Stage(@Context HttpHeaders headers, @PathParam("apiId") String apiId, @PathParam("stageName") String stageName) {
+        String region = regionResolver.resolveRegion(headers);
+        return Response.ok(toV2StageNode(v2Service.getStage(region, apiId, stageName)).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @DELETE
+    @Path("/v2/apis/{apiId}/stages/{stageName}")
+    public Response deleteV2Stage(@Context HttpHeaders headers, @PathParam("apiId") String apiId, @PathParam("stageName") String stageName) {
+        String region = regionResolver.resolveRegion(headers);
+        v2Service.deleteStage(region, apiId, stageName);
+        return Response.noContent().build();
+    }
+
+    @POST
+    @Path("/v2/apis/{apiId}/deployments")
+    public Response createV2Deployment(@Context HttpHeaders headers, @PathParam("apiId") String apiId, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> request = objectMapper.readValue(body, Map.class);
+            Deployment deployment = v2Service.createDeployment(region, apiId, request);
+            return Response.status(201).entity(toV2DeploymentNode(deployment).toString()).type(MediaType.APPLICATION_JSON).build();
+        } catch (IOException e) {
+            throw new AwsException("BadRequestException", e.getMessage(), 400);
+        }
+    }
+
+    @GET
+    @Path("/v2/apis/{apiId}/deployments")
+    public Response getV2Deployments(@Context HttpHeaders headers, @PathParam("apiId") String apiId) {
+        String region = regionResolver.resolveRegion(headers);
+        List<Deployment> deployments = v2Service.getDeployments(region, apiId);
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode items = root.putArray("items");
+        deployments.forEach(d -> items.add(toV2DeploymentNode(d)));
+        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/v2/apis/{apiId}/deployments/{deploymentId}")
+    public Response getV2Deployment(@Context HttpHeaders headers, @PathParam("apiId") String apiId, @PathParam("deploymentId") String deploymentId) {
+        String region = regionResolver.resolveRegion(headers);
+        return Response.ok(toV2DeploymentNode(v2Service.getDeployment(region, apiId, deploymentId)).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @DELETE
+    @Path("/v2/apis/{apiId}/deployments/{deploymentId}")
+    public Response deleteV2Deployment(@Context HttpHeaders headers, @PathParam("apiId") String apiId, @PathParam("deploymentId") String deploymentId) {
+        String region = regionResolver.resolveRegion(headers);
+        v2Service.deleteDeployment(region, apiId, deploymentId);
+        return Response.noContent().build();
     }
 
     // ──────────────────────────── Helpers ────────────────────────────
@@ -843,6 +1045,12 @@ public class ApiGatewayController {
         node.put("httpMethod", m.getHttpMethod());
         node.put("authorizationType", m.getAuthorizationType());
         if (m.getAuthorizerId() != null) node.put("authorizerId", m.getAuthorizerId());
+        if (m.getRequestValidatorId() != null) node.put("requestValidatorId", m.getRequestValidatorId());
+        if (m.getRequestModels() != null && !m.getRequestModels().isEmpty()) {
+            ObjectNode models = objectMapper.createObjectNode();
+            m.getRequestModels().forEach(models::put);
+            node.set("requestModels", models);
+        }
         if (m.getMethodIntegration() != null) {
             node.set("methodIntegration", toIntegrationNode(m.getMethodIntegration()));
         }
@@ -860,6 +1068,7 @@ public class ApiGatewayController {
         node.put("type", i.getType());
         node.put("httpMethod", i.getHttpMethod());
         node.put("uri", i.getUri());
+        node.put("passthroughBehavior", i.getPassthroughBehavior());
         return node;
     }
 
@@ -870,7 +1079,7 @@ public class ApiGatewayController {
         return node;
     }
 
-    private ObjectNode toDeploymentNode(Deployment d) {
+    private ObjectNode toDeploymentNode(io.github.hectorvent.floci.services.apigateway.model.Deployment d) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("id", d.id());
         if (d.description() != null) node.put("description", d.description());
@@ -878,7 +1087,7 @@ public class ApiGatewayController {
         return node;
     }
 
-    private ObjectNode toStageNode(Stage s) {
+    private ObjectNode toStageNode(io.github.hectorvent.floci.services.apigateway.model.Stage s) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("stageName", s.getStageName());
         node.put("deploymentId", s.getDeploymentId());
@@ -892,7 +1101,7 @@ public class ApiGatewayController {
         return node;
     }
 
-    private ObjectNode toAuthorizerNode(Authorizer a) {
+    private ObjectNode toAuthorizerNode(io.github.hectorvent.floci.services.apigateway.model.Authorizer a) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("id", a.getId());
         node.put("name", a.getName());
@@ -948,6 +1157,16 @@ public class ApiGatewayController {
         return node;
     }
 
+    private ObjectNode toModelNode(io.github.hectorvent.floci.services.apigateway.model.Model m) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("id", m.getId());
+        node.put("name", m.getName());
+        if (m.getDescription() != null) node.put("description", m.getDescription());
+        node.put("contentType", m.getContentType());
+        if (m.getSchema() != null) node.put("schema", m.getSchema());
+        return node;
+    }
+
     private ObjectNode toRequestValidatorNode(RequestValidator v) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("id", v.getId());
@@ -985,9 +1204,45 @@ public class ApiGatewayController {
         return node;
     }
 
-    private String apiIdFromArn(String arn) {
-        String[] parts = arn.split("/restapis/");
-        if (parts.length < 2) return arn;
-        return parts[1].split("/")[0];
+    private ObjectNode toV2StageNode(Stage s) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("stageName", s.getStageName());
+        if (s.getDeploymentId() != null) node.put("deploymentId", s.getDeploymentId());
+        node.put("autoDeploy", s.isAutoDeploy());
+        node.put("createdDate", java.time.Instant.ofEpochMilli(s.getCreatedDate()).toString());
+        node.put("lastUpdatedDate", java.time.Instant.ofEpochMilli(s.getLastUpdatedDate()).toString());
+        return node;
     }
+
+    private ObjectNode toV2DeploymentNode(Deployment d) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("deploymentId", d.getDeploymentId());
+        node.put("deploymentStatus", d.getDeploymentStatus());
+        if (d.getDescription() != null) node.put("description", d.getDescription());
+        node.put("createdDate", java.time.Instant.ofEpochMilli(d.getCreatedDate()).toString());
+        return node;
+    }
+
+    private ObjectNode toV2AuthorizerNode(Authorizer a) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("authorizerId", a.getAuthorizerId());
+        node.put("authorizerType", a.getAuthorizerType());
+        node.put("name", a.getName());
+        if (a.getIdentitySource() != null) {
+            ArrayNode idSources = node.putArray("identitySource");
+            a.getIdentitySource().forEach(idSources::add);
+        }
+        if (a.getJwtConfiguration() != null) {
+            ObjectNode jwt = node.putObject("jwtConfiguration");
+            if (a.getJwtConfiguration().audience() != null) {
+                ArrayNode aud = jwt.putArray("audience");
+                a.getJwtConfiguration().audience().forEach(aud::add);
+            }
+            if (a.getJwtConfiguration().issuer() != null) {
+                jwt.put("issuer", a.getJwtConfiguration().issuer());
+            }
+        }
+        return node;
+    }
+
 }

@@ -83,9 +83,15 @@ public class LambdaController {
         ObjectNode root = objectMapper.createObjectNode();
         root.set("Configuration", objectMapper.valueToTree(buildFunctionConfiguration(fn)));
         ObjectNode code = root.putObject("Code");
-        code.put("Location", "https://awslambda-" + region + "-tasks.s3." + region
-                + ".amazonaws.com/" + fn.getFunctionName());
-        code.put("RepositoryType", "S3");
+        if ("Image".equals(fn.getPackageType()) && fn.getImageUri() != null) {
+            code.put("RepositoryType", "ECR");
+            code.put("ImageUri", fn.getImageUri());
+            code.put("ResolvedImageUri", fn.getImageUri());
+        } else {
+            code.put("Location", "https://awslambda-" + region + "-tasks.s3." + region
+                    + ".amazonaws.com/" + fn.getFunctionName());
+            code.put("RepositoryType", "S3");
+        }
 
         return Response.ok(root).build();
     }
@@ -117,6 +123,26 @@ public class LambdaController {
         return Response.ok(buildFunctionConfiguration(fn)).build();
     }
 
+    // ──────────────────────────── UpdateFunctionConfiguration ────────────────────────────
+
+    @PUT
+    @Path("/functions/{functionName}/configuration")
+    public Response updateFunctionConfiguration(@Context HttpHeaders headers,
+                                                @PathParam("functionName") String functionName,
+                                                String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> request = objectMapper.readValue(body, Map.class);
+            LambdaFunction fn = lambdaService.updateFunctionConfiguration(region, functionName, request);
+            return Response.ok(buildFunctionConfiguration(fn)).build();
+        } catch (AwsException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new AwsException("InvalidParameterValueException", e.getMessage(), 400);
+        }
+    }
+
     // ──────────────────────────── UpdateFunctionCode ────────────────────────────
 
     @PUT
@@ -146,6 +172,22 @@ public class LambdaController {
         String region = regionResolver.resolveRegion(headers);
         lambdaService.deleteFunction(region, functionName);
         return Response.noContent().build();
+    }
+
+    // ──────────────────────────── GetFunctionCodeSigningConfig ────────────────────────────
+
+    @GET
+    @Path("/functions/{functionName}/code-signing-config")
+    public Response getFunctionCodeSigningConfig(@Context HttpHeaders headers,
+                                                  @PathParam("functionName") String functionName) {
+        String region = regionResolver.resolveRegion(headers);
+        // Verify the function exists
+        lambdaService.getFunction(region, functionName);
+        // Return empty code signing config — floci does not enforce code signing
+        ObjectNode root = objectMapper.createObjectNode();
+        root.put("CodeSigningConfigArn", "");
+        root.put("FunctionName", functionName);
+        return Response.ok(root).build();
     }
 
     // ──────────────────────────── Invoke ────────────────────────────
@@ -249,6 +291,18 @@ public class LambdaController {
         node.put("BatchSize", esm.getBatchSize());
         node.put("State", esm.getState());
         node.put("LastModified", (double) esm.getLastModified() / 1000.0);
+        ArrayNode responseTypes = node.putArray("FunctionResponseTypes");
+        if (esm.getFunctionResponseTypes() != null) {
+            esm.getFunctionResponseTypes().forEach(responseTypes::add);
+        }
+        // Only emit ScalingConfig when a cap is actually set — AWS omits the
+        // field entirely on mappings with no MaximumConcurrency rather than
+        // returning an empty object.
+        Integer maxConcurrency = esm.getMaximumConcurrency();
+        if (maxConcurrency != null) {
+            ObjectNode scaling = node.putObject("ScalingConfig");
+            scaling.put("MaximumConcurrency", maxConcurrency.intValue());
+        }
         @SuppressWarnings("unchecked")
         Map<String, Object> result = objectMapper.convertValue(node, Map.class);
         return result;
@@ -272,6 +326,20 @@ public class LambdaController {
         }
         LambdaFunction version = lambdaService.publishVersion(region, functionName, description);
         return Response.status(201).entity(buildFunctionConfiguration(version)).build();
+    }
+
+    @GET
+    @Path("/functions/{functionName}/versions")
+    public Response listVersionsByFunction(@Context HttpHeaders headers,
+                                           @PathParam("functionName") String functionName) {
+        String region = regionResolver.resolveRegion(headers);
+        List<LambdaFunction> versions = lambdaService.listVersionsByFunction(region, functionName);
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode items = root.putArray("Versions");
+        for (LambdaFunction v : versions) {
+            items.add(objectMapper.valueToTree(buildFunctionConfiguration(v)));
+        }
+        return Response.ok(root).build();
     }
 
     // ──────────────────────────── Aliases ────────────────────────────
@@ -352,6 +420,60 @@ public class LambdaController {
         return Response.noContent().build();
     }
 
+    // ──────────────────────────── Permissions (Policy) ────────────────────────────
+
+    @POST
+    @Path("/functions/{functionName}/policy")
+    public Response addPermission(@Context HttpHeaders headers,
+                                  @PathParam("functionName") String functionName,
+                                  String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> request = objectMapper.readValue(body, Map.class);
+            Map<String, Object> statement = lambdaService.addPermission(region, functionName, request);
+            String statementJson = objectMapper.writeValueAsString(statement);
+            ObjectNode root = objectMapper.createObjectNode();
+            root.put("Statement", statementJson);
+            return Response.status(201).entity(root).build();
+        } catch (AwsException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new AwsException("InvalidParameterValueException", e.getMessage(), 400);
+        }
+    }
+
+    @GET
+    @Path("/functions/{functionName}/policy")
+    public Response getPolicy(@Context HttpHeaders headers,
+                              @PathParam("functionName") String functionName) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            Map<String, Object> data = lambdaService.getPolicy(region, functionName);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> policy = (Map<String, Object>) data.get("policy");
+            String policyJson = objectMapper.writeValueAsString(policy);
+            ObjectNode root = objectMapper.createObjectNode();
+            root.put("Policy", policyJson);
+            root.put("RevisionId", (String) data.get("revisionId"));
+            return Response.ok(root).build();
+        } catch (AwsException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new AwsException("ServiceException", e.getMessage(), 500);
+        }
+    }
+
+    @DELETE
+    @Path("/functions/{functionName}/policy/{statementId}")
+    public Response removePermission(@Context HttpHeaders headers,
+                                     @PathParam("functionName") String functionName,
+                                     @PathParam("statementId") String statementId) {
+        String region = regionResolver.resolveRegion(headers);
+        lambdaService.removePermission(region, functionName, statementId);
+        return Response.noContent().build();
+    }
+
     // ──────────────────────────── Helper ────────────────────────────
 
     private Map<String, Object> buildAliasResponse(LambdaAlias alias) {
@@ -384,7 +506,8 @@ public class LambdaController {
         if (fn.getImageUri() != null) node.put("ImageUri", fn.getImageUri());
         node.put("LastModified", String.valueOf(fn.getLastModified()));
         node.put("RevisionId", fn.getRevisionId());
-        node.put("Version", "$LATEST");
+        node.put("Version", fn.getVersion());
+        node.put("LastUpdateStatus", "Successful");
 
         if (fn.getEnvironment() != null && !fn.getEnvironment().isEmpty()) {
             ObjectNode envNode = node.putObject("Environment");

@@ -32,6 +32,8 @@ class S3MultipartIntegrationTest {
             .contentType("application/octet-stream")
             .header("x-amz-meta-owner", "team-a")
             .header("x-amz-storage-class", "STANDARD_IA")
+            .header("Content-Disposition", "attachment; filename=\"multipart.bin\"")
+            .header("x-amz-server-side-encryption", "AES256")
         .when()
             .post("/" + BUCKET + "/" + KEY + "?uploads")
         .then()
@@ -69,6 +71,23 @@ class S3MultipartIntegrationTest {
 
     @Test
     @Order(5)
+    void listParts() {
+        given()
+        .when()
+            .get("/" + BUCKET + "/" + KEY + "?uploadId=" + uploadId)
+        .then()
+            .statusCode(200)
+            .body(containsString("<ListPartsResult"))
+            .body(containsString("<Bucket>" + BUCKET + "</Bucket>"))
+            .body(containsString("<Key>" + KEY + "</Key>"))
+            .body(containsString("<UploadId>" + uploadId + "</UploadId>"))
+            .body(containsString("<PartNumber>1</PartNumber>"))
+            .body(containsString("<PartNumber>2</PartNumber>"))
+            .body(containsString("<IsTruncated>false</IsTruncated>"));
+    }
+
+    @Test
+    @Order(6)
     void listMultipartUploads() {
         given()
         .when()
@@ -80,7 +99,7 @@ class S3MultipartIntegrationTest {
     }
 
     @Test
-    @Order(6)
+    @Order(8)
     void completeMultipartUpload() {
         String completeXml = """
                 <CompleteMultipartUpload>
@@ -101,20 +120,22 @@ class S3MultipartIntegrationTest {
     }
 
     @Test
-    @Order(7)
+    @Order(9)
     void getCompletedObject() {
         given()
         .when()
             .get("/" + BUCKET + "/" + KEY)
         .then()
             .statusCode(200)
+            .header("Content-Disposition", equalTo("attachment; filename=\"multipart.bin\""))
+            .header("x-amz-server-side-encryption", equalTo("AES256"))
             .header("x-amz-meta-owner", equalTo("team-a"))
             .header("x-amz-storage-class", equalTo("STANDARD_IA"))
             .body(equalTo("Part1Data-HelloPart2Data-World"));
     }
 
     @Test
-    @Order(8)
+    @Order(10)
     void getMultipartObjectAttributes() {
         given()
             .header("x-amz-object-attributes", "ObjectParts,Checksum,StorageClass")
@@ -131,7 +152,7 @@ class S3MultipartIntegrationTest {
     }
 
     @Test
-    @Order(9)
+    @Order(11)
     void multipartUploadNoLongerListed() {
         given()
         .when()
@@ -142,7 +163,7 @@ class S3MultipartIntegrationTest {
     }
 
     @Test
-    @Order(10)
+    @Order(12)
     void abortMultipartUpload() {
         // Initiate new upload
         String newUploadId = given()
@@ -177,9 +198,87 @@ class S3MultipartIntegrationTest {
     }
 
     @Test
-    @Order(11)
+    @Order(13)
+    void uploadPartCopy() {
+        // Put a source object
+        given()
+            .body("ABCDEFGHIJ")
+        .when()
+            .put("/" + BUCKET + "/source-for-copy.bin")
+        .then()
+            .statusCode(200);
+
+        // Initiate multipart upload for destination
+        String copyUploadId = given()
+            .when()
+                .post("/" + BUCKET + "/copy-dest.bin?uploads")
+            .then()
+                .statusCode(200)
+                .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+
+        // UploadPartCopy full source
+        given()
+            .header("x-amz-copy-source", "/" + BUCKET + "/source-for-copy.bin")
+        .when()
+            .put("/" + BUCKET + "/copy-dest.bin?uploadId=" + copyUploadId + "&partNumber=1")
+        .then()
+            .statusCode(200)
+            .body(containsString("<CopyPartResult"))
+            .body(containsString("<ETag>"));
+
+        // UploadPartCopy with range (bytes 2-5 → "CDEF")
+        given()
+            .header("x-amz-copy-source", "/" + BUCKET + "/source-for-copy.bin")
+            .header("x-amz-copy-source-range", "bytes=2-5")
+        .when()
+            .put("/" + BUCKET + "/copy-dest.bin?uploadId=" + copyUploadId + "&partNumber=2")
+        .then()
+            .statusCode(200)
+            .body(containsString("<CopyPartResult"))
+            .body(containsString("<ETag>"));
+
+        // Complete the upload
+        String completeXml = """
+                <CompleteMultipartUpload>
+                    <Part><PartNumber>1</PartNumber><ETag>etag1</ETag></Part>
+                    <Part><PartNumber>2</PartNumber><ETag>etag2</ETag></Part>
+                </CompleteMultipartUpload>""";
+        given()
+            .contentType("application/xml")
+            .body(completeXml)
+        .when()
+            .post("/" + BUCKET + "/copy-dest.bin?uploadId=" + copyUploadId)
+        .then()
+            .statusCode(200);
+
+        // Verify contents: full source + ranged slice
+        given()
+        .when()
+            .get("/" + BUCKET + "/copy-dest.bin")
+        .then()
+            .statusCode(200)
+            .body(equalTo("ABCDEFGHIJCDEF"));
+    }
+
+    @Test
+    @Order(14)
+    void initiateMultipartUploadRejectsUnsupportedServerSideEncryption() {
+        given()
+            .header("x-amz-server-side-encryption", "totally-unsupported")
+        .when()
+            .post("/" + BUCKET + "/invalid-sse.bin?uploads")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidArgument"))
+            .body(containsString("Unsupported x-amz-server-side-encryption value"));
+    }
+
+    @Test
+    @Order(15)
     void cleanUp() {
         given().when().delete("/" + BUCKET + "/" + KEY).then().statusCode(204);
+        given().when().delete("/" + BUCKET + "/source-for-copy.bin").then().statusCode(204);
+        given().when().delete("/" + BUCKET + "/copy-dest.bin").then().statusCode(204);
         given().when().delete("/" + BUCKET).then().statusCode(204);
     }
 }

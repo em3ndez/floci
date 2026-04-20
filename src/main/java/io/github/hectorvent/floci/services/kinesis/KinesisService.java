@@ -21,6 +21,13 @@ import java.util.concurrent.atomic.AtomicLong;
 @ApplicationScoped
 public class KinesisService {
     private static final Logger LOG = Logger.getLogger(KinesisService.class);
+    private static final Set<String> VALID_SHARD_LEVEL_METRICS = Set.of(
+            "IncomingBytes", "IncomingRecords", "OutgoingBytes", "OutgoingRecords",
+            "WriteProvisionedThroughputExceeded", "ReadProvisionedThroughputExceeded",
+            "IteratorAgeMilliseconds", "ALL");
+    private static final Set<String> VALID_STREAM_MODES = Set.of("PROVISIONED", "ON_DEMAND");
+    private static final String DEFAULT_STREAM_MODE = "PROVISIONED";
+
     private final StorageBackend<String, KinesisStream> store;
     private final StorageBackend<String, KinesisConsumer> consumerStore;
     private final RegionResolver regionResolver;
@@ -44,6 +51,16 @@ public class KinesisService {
     }
 
     public KinesisStream createStream(String streamName, int shardCount, String region) {
+        return createStream(streamName, shardCount, null, region);
+    }
+
+    public KinesisStream createStream(String streamName, int shardCount, String streamMode, String region) {
+        String resolvedMode = streamMode != null ? streamMode : DEFAULT_STREAM_MODE;
+        if (!VALID_STREAM_MODES.contains(resolvedMode)) {
+            throw new AwsException("InvalidArgumentException",
+                    "StreamMode must be PROVISIONED or ON_DEMAND, got: " + resolvedMode, 400);
+        }
+
         String storageKey = regionKey(region, streamName);
         if (store.get(storageKey).isPresent()) {
             throw new AwsException("ResourceInUseException", "Stream already exists: " + streamName, 400);
@@ -51,6 +68,7 @@ public class KinesisService {
 
         String arn = regionResolver.buildArn("kinesis", region, "stream/" + streamName);
         KinesisStream stream = new KinesisStream(streamName, arn);
+        stream.setStreamMode(resolvedMode);
 
         for (int i = 0; i < shardCount; i++) {
             String shardId = String.format("shardId-%012d", i);
@@ -58,8 +76,30 @@ public class KinesisService {
         }
 
         store.put(storageKey, stream);
-        LOG.infov("Created Kinesis stream: {0} in region {1} with {2} shards", streamName, region, shardCount);
+        LOG.infov("Created Kinesis stream: {0} in region {1} with {2} shards (mode: {3})",
+                streamName, region, shardCount, resolvedMode);
         return stream;
+    }
+
+    public void updateStreamMode(String streamName, String streamMode, String region) {
+        if (streamMode == null || !VALID_STREAM_MODES.contains(streamMode)) {
+            throw new AwsException("InvalidArgumentException",
+                    "StreamMode must be PROVISIONED or ON_DEMAND, got: " + streamMode, 400);
+        }
+        KinesisStream stream = resolveStream(streamName, region);
+        if (!"ACTIVE".equals(stream.getStreamStatus())) {
+            throw new AwsException("ResourceInUseException",
+                    "Stream " + streamName + " is not ACTIVE (current state: " + stream.getStreamStatus() + ")", 400);
+        }
+        // Same-mode is a no-op. Mirrors the same-value behaviour in
+        // increase/decreaseStreamRetentionPeriod (see #342). Avoids breaking
+        // terraform-provider-aws which calls UpdateStreamMode on every refresh.
+        if (streamMode.equals(stream.getStreamMode())) {
+            return;
+        }
+        stream.setStreamMode(streamMode);
+        store.put(regionKey(region, streamName), stream);
+        LOG.infov("Updated stream mode for {0} to {1}", streamName, streamMode);
     }
 
     public List<String> listStreams(String region) {
@@ -139,6 +179,91 @@ public class KinesisService {
         stream.setEncryptionType(encryptionType);
         stream.setKeyId(keyId);
         store.put(regionKey(region, streamName), stream);
+    }
+
+    public void increaseStreamRetentionPeriod(String streamName, int retentionPeriodHours, String region) {
+        KinesisStream stream = resolveStream(streamName, region);
+        if (retentionPeriodHours > 8760) {
+            throw new AwsException("InvalidArgumentException",
+                    "Retention period must not exceed 8760 hours (365 days)", 400);
+        }
+        if (retentionPeriodHours < stream.getRetentionPeriodHours()) {
+            throw new AwsException("InvalidArgumentException",
+                    "Requested retention period (" + retentionPeriodHours +
+                    " hours) must not be less than current retention period (" +
+                    stream.getRetentionPeriodHours() + " hours)", 400);
+        }
+        // Same value is a no-op on real AWS despite the API doc wording ("must be more than
+        // current"). Proof: terraform-provider-aws calls IncreaseStreamRetentionPeriod on
+        // stream creation unconditionally when retention_period is set (stream.go Create path),
+        // so every default-retention TF stream would fail if AWS rejected same-value. See #342.
+        if (retentionPeriodHours == stream.getRetentionPeriodHours()) {
+            return;
+        }
+        stream.setRetentionPeriodHours(retentionPeriodHours);
+        store.put(regionKey(region, streamName), stream);
+        LOG.infov("Increased retention period for stream {0} to {1} hours", streamName, retentionPeriodHours);
+    }
+
+    public void decreaseStreamRetentionPeriod(String streamName, int retentionPeriodHours, String region) {
+        KinesisStream stream = resolveStream(streamName, region);
+        if (retentionPeriodHours < 24) {
+            throw new AwsException("InvalidArgumentException",
+                    "Retention period must not be less than 24 hours", 400);
+        }
+        if (retentionPeriodHours > stream.getRetentionPeriodHours()) {
+            throw new AwsException("InvalidArgumentException",
+                    "Requested retention period (" + retentionPeriodHours +
+                    " hours) must not be greater than current retention period (" +
+                    stream.getRetentionPeriodHours() + " hours)", 400);
+        }
+        // Same value is a no-op on real AWS (mirrors IncreaseStreamRetentionPeriod). See #342.
+        if (retentionPeriodHours == stream.getRetentionPeriodHours()) {
+            return;
+        }
+        stream.setRetentionPeriodHours(retentionPeriodHours);
+        store.put(regionKey(region, streamName), stream);
+        LOG.infov("Decreased retention period for stream {0} to {1} hours", streamName, retentionPeriodHours);
+    }
+
+    public Set<String> enableEnhancedMonitoring(String streamName, List<String> metrics, String region) {
+        KinesisStream stream = resolveStream(streamName, region);
+        Set<String> current = new HashSet<>(stream.getEnhancedMonitoringMetrics());
+        Set<String> desired = resolveMetrics(metrics);
+        stream.getEnhancedMonitoringMetrics().addAll(desired);
+        store.put(regionKey(region, streamName), stream);
+        LOG.infov("Enabled enhanced monitoring for stream {0}: {1}", streamName, desired);
+        return current;
+    }
+
+    public Set<String> disableEnhancedMonitoring(String streamName, List<String> metrics, String region) {
+        KinesisStream stream = resolveStream(streamName, region);
+        Set<String> current = new HashSet<>(stream.getEnhancedMonitoringMetrics());
+        Set<String> toRemove = resolveMetrics(metrics);
+        stream.getEnhancedMonitoringMetrics().removeAll(toRemove);
+        store.put(regionKey(region, streamName), stream);
+        LOG.infov("Disabled enhanced monitoring for stream {0}: {1}", streamName, toRemove);
+        return current;
+    }
+
+    private Set<String> resolveMetrics(List<String> metrics) {
+        if (metrics.isEmpty()) {
+            throw new AwsException("InvalidArgumentException",
+                    "ShardLevelMetrics must contain at least one metric", 400);
+        }
+        // Validate all entries before expanding ALL
+        for (String m : metrics) {
+            if (!VALID_SHARD_LEVEL_METRICS.contains(m)) {
+                throw new AwsException("InvalidArgumentException",
+                        "Invalid ShardLevelMetric: " + m, 400);
+            }
+        }
+        if (metrics.contains("ALL")) {
+            Set<String> all = new HashSet<>(VALID_SHARD_LEVEL_METRICS);
+            all.remove("ALL");
+            return all;
+        }
+        return new HashSet<>(metrics);
     }
 
     public void stopStreamEncryption(String streamName, String region) {
@@ -226,30 +351,47 @@ public class KinesisService {
         return new java.math.BigInteger(val).subtract(java.math.BigInteger.ONE).toString();
     }
 
+    public record PutRecordResult(String sequenceNumber, String shardId) {}
+
     public String putRecord(String streamName, byte[] data, String partitionKey, String region) {
+        return putRecordWithShardId(streamName, data, partitionKey, region).sequenceNumber();
+    }
+
+    public PutRecordResult putRecordWithShardId(String streamName, byte[] data, String partitionKey, String region) {
         KinesisStream stream = resolveStream(streamName, region);
         KinesisShard shard = selectShard(stream, partitionKey);
-        
+
         String sequenceNumber = String.valueOf(sequenceGenerator.incrementAndGet());
         KinesisRecord record = new KinesisRecord(data, partitionKey, sequenceNumber, Instant.now());
-        
+
         shard.getRecords().add(record);
         store.put(regionKey(region, streamName), stream);
-        
-        return sequenceNumber;
+
+        return new PutRecordResult(sequenceNumber, shard.getShardId());
     }
 
     public String getShardIterator(String streamName, String shardId, String type, String sequenceNumber, String region) {
+        return getShardIterator(streamName, shardId, type, sequenceNumber, null, region);
+    }
+
+    public String getShardIterator(String streamName, String shardId, String type, String sequenceNumber,
+                                   Long timestampMillis, String region) {
         resolveStream(streamName, region); // validate exists
-        // Format: streamName|shardId|type|sequenceNumber|index
-        String raw = String.format("%s|%s|%s|%s|%d", 
-                streamName, shardId, type, sequenceNumber != null ? sequenceNumber : "", 0);
+        // Format: streamName|shardId|type|sequenceNumber|index|timestampMillis
+        // The 6th slot was added for AT_TIMESTAMP; empty for other iterator types.
+        // Old 5-part iterators still decode via split(-1) compatibility in getRecords.
+        String raw = String.format("%s|%s|%s|%s|%d|%s",
+                streamName, shardId, type,
+                sequenceNumber != null ? sequenceNumber : "",
+                0,
+                timestampMillis != null ? timestampMillis.toString() : "");
         return Base64.getEncoder().encodeToString(raw.getBytes(StandardCharsets.UTF_8));
     }
 
     public Map<String, Object> getRecords(String shardIterator, Integer limit, String region) {
         byte[] decoded = Base64.getDecoder().decode(shardIterator);
-        String[] parts = new String(decoded, StandardCharsets.UTF_8).split(java.util.regex.Pattern.quote("|"), 5);
+        // Use limit=-1 so trailing empty slots round-trip and old 5-part iterators still work.
+        String[] parts = new String(decoded, StandardCharsets.UTF_8).split(java.util.regex.Pattern.quote("|"), -1);
         if (parts.length < 5) throw new AwsException("InvalidArgumentException", "Invalid shard iterator", 400);
 
         String streamName = parts[0];
@@ -257,6 +399,14 @@ public class KinesisService {
         String type = parts[2];
         String startSeq = parts[3];
         int lastIndex = Integer.parseInt(parts[4]);
+        Long timestampMillis = null;
+        if (parts.length >= 6 && !parts[5].isEmpty()) {
+            try {
+                timestampMillis = Long.parseLong(parts[5]);
+            } catch (NumberFormatException e) {
+                throw new AwsException("InvalidArgumentException", "Invalid timestamp in shard iterator", 400);
+            }
+        }
 
         KinesisStream stream = resolveStream(streamName, region);
         KinesisShard shard = stream.getShards().stream()
@@ -286,6 +436,21 @@ public class KinesisService {
                     break;
                 }
             }
+        } else if ("AT_TIMESTAMP".equals(type)) {
+            if (timestampMillis == null) {
+                throw new AwsException("InvalidArgumentException",
+                        "AT_TIMESTAMP iterator requires a Timestamp", 400);
+            }
+            // First record with ApproximateArrivalTimestamp >= requested timestamp.
+            // If none match (all records predate timestamp or shard is empty), start past end (no records returned, caught up).
+            startIndex = allRecords.size();
+            for (int i = 0; i < allRecords.size(); i++) {
+                Instant arr = allRecords.get(i).getApproximateArrivalTimestamp();
+                if (arr != null && arr.toEpochMilli() >= timestampMillis) {
+                    startIndex = i;
+                    break;
+                }
+            }
         }
 
         int max = limit != null ? Math.min(limit, 1000) : 1000;
@@ -296,15 +461,34 @@ public class KinesisService {
             nextIndex = i + 1;
         }
 
+        // Continuation iterator: type=TRIM_HORIZON + resume-at-nextIndex is the existing
+        // "resume by index" convention (the type label is misleading but preserved for compat).
+        // Timestamp slot empty on continuation.
         String nextIterator = Base64.getEncoder().encodeToString(
-                String.format("%s|%s|%s|%s|%d", streamName, shardId, "TRIM_HORIZON", "", nextIndex)
+                String.format("%s|%s|%s|%s|%d|", streamName, shardId, "TRIM_HORIZON", "", nextIndex)
                 .getBytes(StandardCharsets.UTF_8));
 
         Map<String, Object> response = new HashMap<>();
         response.put("Records", result);
         response.put("NextShardIterator", nextIterator);
-        response.put("MillisBehindLatest", Math.max(0, allRecords.size() - nextIndex));
+        response.put("MillisBehindLatest", computeMillisBehindLatest(allRecords, nextIndex));
         return response;
+    }
+
+    /**
+     * Time delta in ms between the last record returned and the shard tip.
+     * Zero when caught up, the shard is empty, or no records were returned.
+     */
+    private long computeMillisBehindLatest(List<KinesisRecord> allRecords, int nextIndex) {
+        if (nextIndex <= 0 || nextIndex >= allRecords.size()) {
+            return 0L;
+        }
+        Instant lastReturned = allRecords.get(nextIndex - 1).getApproximateArrivalTimestamp();
+        Instant tip = allRecords.get(allRecords.size() - 1).getApproximateArrivalTimestamp();
+        if (lastReturned == null || tip == null) {
+            return 0L;
+        }
+        return Math.max(0L, tip.toEpochMilli() - lastReturned.toEpochMilli());
     }
 
     private KinesisStream resolveStream(String streamName, String region) {

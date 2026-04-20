@@ -7,7 +7,7 @@ Thank you for your interest in contributing! Floci is a community-driven project
 - **Bug reports** — open an issue with a minimal reproduction
 - **Feature requests** — open an issue describing the AWS behavior you need
 - **Pull requests** — bug fixes, new service implementations, or improvements
-- **Compatibility tests** — add cases to `../floci-compatibility-tests`
+- **Compatibility tests** — add cases to `./compatibility-tests/`
 
 ## Getting Started
 
@@ -30,7 +30,7 @@ sdk install java 25-open
 This project includes a Maven wrapper, so you don't need to install Maven separately:
 
 ```bash
-git clone https://github.com/hectorvent/floci.git
+git clone https://github.com/floci-io/floci.git
 cd floci
 ./mvnw quarkus:dev     # hot reload on port 4566
 ```
@@ -68,6 +68,8 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) �
 | `chore:` | Build, CI, dependencies | none |
 | `BREAKING CHANGE:` | Footer or `!` suffix — incompatible change | major |
 
+Do not include `Co-Authored-By` trailers for AI tools in commit messages. Attribution should be limited to human contributors.
+
 **Examples:**
 
 ```
@@ -78,16 +80,27 @@ feat!: change default storage mode to persistent
 
 ## Architecture
 
-See [CLAUDE.md](CLAUDE.md) for a detailed description of the three-layer architecture (Controller → Service → Storage), the AWS wire protocol mapping, and conventions for adding new services.
+See [AGENT.md](AGENT.md) for a detailed description of the three-layer architecture (Controller → Service → Storage), the AWS wire protocol mapping, and conventions for adding new services.
+
+`AGENT.md` is the canonical agent instructions file for this repository. If your coding agent expects a different filename, create a local symlink to `AGENT.md` instead of copying the file.
+
+```bash
+ln -s AGENT.md CLAUDE.md
+ln -s AGENT.md GEMINI.md
+ln -s AGENT.md COPILOT.md
+```
 
 ## Adding a New AWS Service
 
 1. Create a package under `src/main/java/.../services/<service>/`
 2. Add a Controller (follow the correct protocol — Query, JSON 1.1, REST JSON, or REST XML)
 3. Add a Service (`@ApplicationScoped`) and model POJOs
-4. Register in `ServiceRegistry`
-5. Add config entries in `EmulatorConfig.java` and `application.yml`
-6. Add integration tests in `*IntegrationTest.java`
+4. Add config entries in `EmulatorConfig.java` and `application.yml`
+5. Register a `ServiceDescriptor` in `ResolvedServiceCatalog`
+6. Wire controller/handler dispatch for the service
+7. Add integration tests in `*IntegrationTest.java`
+
+`ServiceRegistry`, `ServiceEnabledFilter`, and `StorageFactory` now resolve service metadata from the descriptor catalog. Adding a service should not require new service-keyed switch statements in those consumers.
 
 Always implement the **real AWS wire protocol** — never invent custom endpoints. The AWS SDK must work against Floci without modification.
 

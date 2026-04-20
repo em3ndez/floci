@@ -4,13 +4,17 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisConsumer;
+import io.github.hectorvent.floci.services.kinesis.model.KinesisRecord;
+import io.github.hectorvent.floci.services.kinesis.model.KinesisShard;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -103,6 +107,78 @@ class KinesisServiceTest {
         @SuppressWarnings("unchecked")
         var records = (List<?>) result.get("Records");
         assertTrue(records.isEmpty());
+        assertEquals(0L, ((Number) result.get("MillisBehindLatest")).longValue());
+    }
+
+    @Test
+    void millisBehindLatestIsZeroOnEmptyShard() {
+        kinesisService.createStream("empty", 1, REGION);
+        String shardId = kinesisService.describeStream("empty", REGION).getShards().getFirst().getShardId();
+        String iterator = kinesisService.getShardIterator("empty", shardId, "TRIM_HORIZON", null, REGION);
+
+        Map<String, Object> result = kinesisService.getRecords(iterator, 10, REGION);
+
+        assertEquals(0L, ((Number) result.get("MillisBehindLatest")).longValue());
+    }
+
+    @Test
+    void millisBehindLatestIsZeroWhenCaughtUp() {
+        kinesisService.createStream("my-stream", 1, REGION);
+        kinesisService.putRecord("my-stream", "a".getBytes(StandardCharsets.UTF_8), "pk", REGION);
+        kinesisService.putRecord("my-stream", "b".getBytes(StandardCharsets.UTF_8), "pk", REGION);
+
+        String shardId = kinesisService.describeStream("my-stream", REGION).getShards().getFirst().getShardId();
+        String iterator = kinesisService.getShardIterator("my-stream", shardId, "TRIM_HORIZON", null, REGION);
+
+        Map<String, Object> result = kinesisService.getRecords(iterator, 10, REGION);
+
+        @SuppressWarnings("unchecked")
+        var records = (List<?>) result.get("Records");
+        assertEquals(2, records.size());
+        assertEquals(0L, ((Number) result.get("MillisBehindLatest")).longValue());
+    }
+
+    @Test
+    void millisBehindLatestIsTimeDeltaWhenBatchLimitHit() {
+        kinesisService.createStream("my-stream", 1, REGION);
+        kinesisService.putRecord("my-stream", "a".getBytes(StandardCharsets.UTF_8), "pk", REGION);
+        kinesisService.putRecord("my-stream", "b".getBytes(StandardCharsets.UTF_8), "pk", REGION);
+        kinesisService.putRecord("my-stream", "c".getBytes(StandardCharsets.UTF_8), "pk", REGION);
+
+        // Overwrite timestamps so we can assert a deterministic delta.
+        KinesisShard shard = kinesisService.describeStream("my-stream", REGION).getShards().getFirst();
+        List<KinesisRecord> records = shard.getRecords();
+        Instant base = Instant.parse("2026-01-01T00:00:00Z");
+        records.get(0).setApproximateArrivalTimestamp(base);
+        records.get(1).setApproximateArrivalTimestamp(base.plusMillis(1500));
+        records.get(2).setApproximateArrivalTimestamp(base.plusMillis(4000));
+
+        String iterator = kinesisService.getShardIterator("my-stream", shard.getShardId(), "TRIM_HORIZON", null, REGION);
+
+        Map<String, Object> result = kinesisService.getRecords(iterator, 2, REGION);
+
+        @SuppressWarnings("unchecked")
+        var returned = (List<?>) result.get("Records");
+        assertEquals(2, returned.size());
+        // Last returned = records[1] at +1500ms, tip = records[2] at +4000ms, delta = 2500ms
+        assertEquals(2500L, ((Number) result.get("MillisBehindLatest")).longValue());
+    }
+
+    @Test
+    void millisBehindLatestIsZeroWhenTimestampsMissing() {
+        kinesisService.createStream("my-stream", 1, REGION);
+        kinesisService.putRecord("my-stream", "a".getBytes(StandardCharsets.UTF_8), "pk", REGION);
+        kinesisService.putRecord("my-stream", "b".getBytes(StandardCharsets.UTF_8), "pk", REGION);
+
+        KinesisShard shard = kinesisService.describeStream("my-stream", REGION).getShards().getFirst();
+        // Simulate a record with no arrival timestamp (e.g. legacy data or a partial put).
+        shard.getRecords().getFirst().setApproximateArrivalTimestamp(null);
+
+        String iterator = kinesisService.getShardIterator("my-stream", shard.getShardId(), "TRIM_HORIZON", null, REGION);
+        Map<String, Object> result = kinesisService.getRecords(iterator, 1, REGION);
+
+        // First record returned, second still ahead; null timestamp must not NPE.
+        assertEquals(0L, ((Number) result.get("MillisBehindLatest")).longValue());
     }
 
     @Test
@@ -192,6 +268,76 @@ class KinesisServiceTest {
     }
 
     @Test
+    void enableEnhancedMonitoring() {
+        kinesisService.createStream("my-stream", 1, REGION);
+        Set<String> before = kinesisService.enableEnhancedMonitoring(
+                "my-stream", List.of("IncomingBytes", "OutgoingBytes"), REGION);
+
+        assertTrue(before.isEmpty());
+        KinesisStream stream = kinesisService.describeStream("my-stream", REGION);
+        assertTrue(stream.getEnhancedMonitoringMetrics().contains("IncomingBytes"));
+        assertTrue(stream.getEnhancedMonitoringMetrics().contains("OutgoingBytes"));
+    }
+
+    @Test
+    void enableEnhancedMonitoringAll() {
+        kinesisService.createStream("my-stream", 1, REGION);
+        kinesisService.enableEnhancedMonitoring("my-stream", List.of("ALL"), REGION);
+
+        KinesisStream stream = kinesisService.describeStream("my-stream", REGION);
+        assertEquals(7, stream.getEnhancedMonitoringMetrics().size());
+        assertTrue(stream.getEnhancedMonitoringMetrics().contains("IncomingBytes"));
+        assertTrue(stream.getEnhancedMonitoringMetrics().contains("IteratorAgeMilliseconds"));
+    }
+
+    @Test
+    void disableEnhancedMonitoring() {
+        kinesisService.createStream("my-stream", 1, REGION);
+        kinesisService.enableEnhancedMonitoring(
+                "my-stream", List.of("IncomingBytes", "OutgoingBytes", "IncomingRecords"), REGION);
+        Set<String> before = kinesisService.disableEnhancedMonitoring(
+                "my-stream", List.of("OutgoingBytes"), REGION);
+
+        assertEquals(3, before.size());
+        KinesisStream stream = kinesisService.describeStream("my-stream", REGION);
+        assertTrue(stream.getEnhancedMonitoringMetrics().contains("IncomingBytes"));
+        assertTrue(stream.getEnhancedMonitoringMetrics().contains("IncomingRecords"));
+        assertFalse(stream.getEnhancedMonitoringMetrics().contains("OutgoingBytes"));
+    }
+
+    @Test
+    void disableEnhancedMonitoringAll() {
+        kinesisService.createStream("my-stream", 1, REGION);
+        kinesisService.enableEnhancedMonitoring(
+                "my-stream", List.of("IncomingBytes", "OutgoingBytes"), REGION);
+        kinesisService.disableEnhancedMonitoring("my-stream", List.of("ALL"), REGION);
+
+        KinesisStream stream = kinesisService.describeStream("my-stream", REGION);
+        assertTrue(stream.getEnhancedMonitoringMetrics().isEmpty());
+    }
+
+    @Test
+    void enableEnhancedMonitoringInvalidMetric() {
+        kinesisService.createStream("my-stream", 1, REGION);
+        assertThrows(AwsException.class, () ->
+                kinesisService.enableEnhancedMonitoring("my-stream", List.of("BogusMetric"), REGION));
+    }
+
+    @Test
+    void enableEnhancedMonitoringEmptyListThrows() {
+        kinesisService.createStream("my-stream", 1, REGION);
+        assertThrows(AwsException.class, () ->
+                kinesisService.enableEnhancedMonitoring("my-stream", List.of(), REGION));
+    }
+
+    @Test
+    void enableEnhancedMonitoringAllWithInvalidThrows() {
+        kinesisService.createStream("my-stream", 1, REGION);
+        assertThrows(AwsException.class, () ->
+                kinesisService.enableEnhancedMonitoring("my-stream", List.of("ALL", "BogusMetric"), REGION));
+    }
+
+    @Test
     void startAndStopEncryption() {
         kinesisService.createStream("my-stream", 1, REGION);
         kinesisService.startStreamEncryption("my-stream", "KMS", "my-key-id", REGION);
@@ -205,5 +351,57 @@ class KinesisServiceTest {
         KinesisStream unencrypted = kinesisService.describeStream("my-stream", REGION);
         assertEquals("NONE", unencrypted.getEncryptionType());
         assertNull(unencrypted.getKeyId());
+    }
+
+    @Test
+    void legacyFivePartIteratorStillDecodes() {
+        kinesisService.createStream("my-stream", 1, REGION);
+        kinesisService.putRecord("my-stream", "a".getBytes(StandardCharsets.UTF_8), "pk", REGION);
+        kinesisService.putRecord("my-stream", "b".getBytes(StandardCharsets.UTF_8), "pk", REGION);
+
+        // Hand-crafted 5-part iterator in the pre-bump format.
+        String raw = "my-stream|shardId-000000000000|TRIM_HORIZON||0";
+        String legacyIterator = java.util.Base64.getEncoder()
+                .encodeToString(raw.getBytes(StandardCharsets.UTF_8));
+
+        Map<String, Object> result = kinesisService.getRecords(legacyIterator, null, REGION);
+        @SuppressWarnings("unchecked")
+        List<KinesisRecord> records = (List<KinesisRecord>) result.get("Records");
+        assertEquals(2, records.size(), "5-part iterator must still decode after encoding bump");
+    }
+
+    @Test
+    void atTimestampIteratorRequiresTimestamp() {
+        kinesisService.createStream("my-stream", 1, REGION);
+        kinesisService.putRecord("my-stream", "a".getBytes(StandardCharsets.UTF_8), "pk", REGION);
+
+        // getShardIterator encodes even with null timestamp (handler is the enforcement point for the API).
+        // But getRecords must reject an AT_TIMESTAMP iterator that lacks the timestamp slot.
+        String iterator = kinesisService.getShardIterator("my-stream", "shardId-000000000000",
+                "AT_TIMESTAMP", null, null, REGION);
+
+        AwsException ex = assertThrows(AwsException.class, () ->
+                kinesisService.getRecords(iterator, null, REGION));
+        assertEquals("InvalidArgumentException", ex.getErrorCode());
+    }
+
+    @Test
+    void atTimestampBoundaryIsInclusive() {
+        kinesisService.createStream("my-stream", 1, REGION);
+        kinesisService.putRecord("my-stream", "a".getBytes(StandardCharsets.UTF_8), "pk", REGION);
+        // Read back the exact timestamp of record 0 to use as the boundary.
+        String firstIter = kinesisService.getShardIterator("my-stream", "shardId-000000000000",
+                "TRIM_HORIZON", null, null, REGION);
+        @SuppressWarnings("unchecked")
+        List<KinesisRecord> first = (List<KinesisRecord>) kinesisService.getRecords(firstIter, null, REGION)
+                .get("Records");
+        Instant arrivedAt = first.get(0).getApproximateArrivalTimestamp();
+
+        String atIter = kinesisService.getShardIterator("my-stream", "shardId-000000000000",
+                "AT_TIMESTAMP", null, arrivedAt.toEpochMilli(), REGION);
+        @SuppressWarnings("unchecked")
+        List<KinesisRecord> got = (List<KinesisRecord>) kinesisService.getRecords(atIter, null, REGION)
+                .get("Records");
+        assertEquals(1, got.size(), "AT_TIMESTAMP boundary is >= (inclusive)");
     }
 }

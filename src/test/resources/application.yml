@@ -2,6 +2,8 @@ quarkus:
   http:
     port: 0
     test-port: 0
+    limits:
+      max-body-size: ${floci.max-request-size}M
 
 floci:
   base-url: "http://localhost:4566"
@@ -14,34 +16,36 @@ floci:
       compaction-interval-ms: 60000
     services:
       ssm:
-        mode: memory
         flush-interval-ms: 60000
-      sqs:
-        mode: memory
-      s3:
-        mode: memory
       dynamodb:
-        mode: memory
         flush-interval-ms: 60000
       sns:
-        mode: memory
         flush-interval-ms: 60000
       lambda:
-        mode: memory
         flush-interval-ms: 60000
       cloudwatchlogs:
-        mode: memory
         flush-interval-ms: 60000
       cloudwatchmetrics:
-        mode: memory
         flush-interval-ms: 60000
       secretsmanager:
-        mode: memory
+        flush-interval-ms: 60000
+      acm:
+        flush-interval-ms: 60000
+      opensearch:
         flush-interval-ms: 60000
 
   auth:
     validate-signatures: false
     presign-secret: test-secret
+
+  init-hooks:
+    shell-executable: /bin/sh
+    timeout-seconds: 5
+    shutdown-grace-period-seconds: 2
+
+  docker:
+    log-max-size: "10m"
+    log-max-file: "3"
 
   services:
     ssm:
@@ -62,8 +66,15 @@ floci:
       enabled: true
     apigateway:
       enabled: true
+    apigatewayv2:
+      enabled: true
     iam:
       enabled: true
+      enforcement-enabled: false
+    msk:
+      enabled: true
+      mock: true
+      default-image: "redpandadata/redpanda:latest"
     elasticache:
       enabled: true
       proxy-base-port: 6379
@@ -71,12 +82,14 @@ floci:
       default-image: "valkey/valkey:8"
     rds:
       enabled: true
-      proxy-base-port: 7000
+      proxy-base-port: 7001
       proxy-max-port: 7099
       default-postgres-image: "postgres:16-alpine"
       default-mysql-image: "mysql:8.0"
       default-mariadb-image: "mariadb:11"
     eventbridge:
+      enabled: true
+    scheduler:
       enabled: true
     cloudwatchlogs:
       enabled: true
@@ -88,6 +101,8 @@ floci:
       default-recovery-window-days: 30
     kinesis:
       enabled: true
+    firehose:
+      enabled: true
     kms:
       enabled: true
     cognito:
@@ -96,3 +111,34 @@ floci:
       enabled: true
     cloudformation:
       enabled: true
+    acm:
+      enabled: true
+      validation-wait-seconds: 0
+    athena:
+      enabled: true
+    glue:
+      enabled: true
+    ses:
+      enabled: true
+    opensearch:
+      enabled: true
+      mock: true
+      default-image: "opensearchproject/opensearch:2"
+      proxy-base-port: 9400
+      proxy-max-port: 9499
+    ec2:
+      enabled: true
+    ecs:
+      enabled: true
+      mock: true
+    appconfig:
+      enabled: true
+    appconfigdata:
+      enabled: true
+    ecr:
+      enabled: true
+    bedrock-runtime:
+      enabled: true
+    eks:
+      enabled: true
+      mock: true

@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.services.dynamodb.model.GlobalSecondaryIndex;
 import io.github.hectorvent.floci.services.dynamodb.model.LocalSecondaryIndex;
 import io.github.hectorvent.floci.services.dynamodb.model.KeySchemaElement;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
+import io.github.hectorvent.floci.services.dynamodb.model.ConditionalCheckFailedException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -18,6 +19,7 @@ import org.jboss.logging.Logger;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -37,40 +39,44 @@ public class DynamoDbService {
     private final ConcurrentHashMap<String, ConcurrentSkipListMap<String, JsonNode>> itemsByTable = new ConcurrentHashMap<>();
     private final RegionResolver regionResolver;
     private DynamoDbStreamService streamService;
+    private KinesisStreamingForwarder kinesisForwarder;
 
     @Inject
     public DynamoDbService(StorageFactory storageFactory, RegionResolver regionResolver,
-                           DynamoDbStreamService streamService) {
+                           DynamoDbStreamService streamService,
+                           KinesisStreamingForwarder kinesisForwarder) {
         this(storageFactory.create("dynamodb", "dynamodb-tables.json",
                 new TypeReference<Map<String, TableDefinition>>() {}),
              storageFactory.create("dynamodb", "dynamodb-items.json",
                 new TypeReference<Map<String, Map<String, JsonNode>>>() {}),
-             regionResolver, streamService);
+             regionResolver, streamService, kinesisForwarder);
     }
 
     /** Package-private constructor for testing. */
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore) {
-        this(tableStore, null, new RegionResolver("us-east-1", "000000000000"), null);
+        this(tableStore, null, new RegionResolver("us-east-1", "000000000000"), null, null);
     }
 
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore, RegionResolver regionResolver) {
-        this(tableStore, null, regionResolver, null);
+        this(tableStore, null, regionResolver, null, null);
     }
 
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
                     StorageBackend<String, Map<String, JsonNode>> itemStore,
                     RegionResolver regionResolver) {
-        this(tableStore, itemStore, regionResolver, null);
+        this(tableStore, itemStore, regionResolver, null, null);
     }
 
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
                     StorageBackend<String, Map<String, JsonNode>> itemStore,
                     RegionResolver regionResolver,
-                    DynamoDbStreamService streamService) {
+                    DynamoDbStreamService streamService,
+                    KinesisStreamingForwarder kinesisForwarder) {
         this.tableStore = tableStore;
         this.itemStore = itemStore;
         this.regionResolver = regionResolver;
         this.streamService = streamService;
+        this.kinesisForwarder = kinesisForwarder;
         loadPersistedItems();
     }
 
@@ -180,6 +186,10 @@ public class DynamoDbService {
         return table;
     }
 
+    public void persistTable(String tableName, TableDefinition table, String region) {
+        tableStore.put(regionKey(region, tableName), table);
+    }
+
     public void deleteTable(String tableName) {
         deleteTable(tableName, regionResolver.getDefaultRegion());
     }
@@ -212,17 +222,17 @@ public class DynamoDbService {
     }
 
     public void putItem(String tableName, JsonNode item) {
-        putItem(tableName, item, null, null, null, regionResolver.getDefaultRegion());
+        putItem(tableName, item, null, null, null, regionResolver.getDefaultRegion(), "NONE");
     }
 
     public void putItem(String tableName, JsonNode item, String region) {
-        putItem(tableName, item, null, null, null, region);
+        putItem(tableName, item, null, null, null, region, "NONE");
     }
 
     public void putItem(String tableName, JsonNode item,
                          String conditionExpression,
                          JsonNode exprAttrNames, JsonNode exprAttrValues,
-                         String region) {
+                         String region, String returnValuesOnConditionCheckFailure) {
         String storageKey = regionKey(region, tableName);
         TableDefinition table = tableStore.get(storageKey)
                 .orElseThrow(() -> resourceNotFoundException(tableName));
@@ -233,16 +243,19 @@ public class DynamoDbService {
         JsonNode existing = tableItems.get(itemKey);
 
         if (conditionExpression != null) {
-            evaluateCondition(existing, conditionExpression, exprAttrNames, exprAttrValues);
+            evaluateCondition(existing, conditionExpression, exprAttrNames, exprAttrValues, returnValuesOnConditionCheckFailure);
         }
 
         tableItems.put(itemKey, item);
         persistItems(storageKey);
         LOG.debugv("Put item in {0}: key={1}", tableName, itemKey);
 
+        String eventName = existing == null ? "INSERT" : "MODIFY";
         if (streamService != null) {
-            streamService.captureEvent(tableName,
-                    existing == null ? "INSERT" : "MODIFY", existing, item, table, region);
+            streamService.captureEvent(tableName, eventName, existing, item, table, region);
+        }
+        if (kinesisForwarder != null) {
+            kinesisForwarder.forward(eventName, existing, item, table, region);
         }
     }
 
@@ -264,17 +277,17 @@ public class DynamoDbService {
     }
 
     public JsonNode deleteItem(String tableName, JsonNode key) {
-        return deleteItem(tableName, key, null, null, null, regionResolver.getDefaultRegion());
+        return deleteItem(tableName, key, null, null, null, regionResolver.getDefaultRegion(), "NONE");
     }
 
     public JsonNode deleteItem(String tableName, JsonNode key, String region) {
-        return deleteItem(tableName, key, null, null, null, region);
+        return deleteItem(tableName, key, null, null, null, region, "NONE");
     }
 
     public JsonNode deleteItem(String tableName, JsonNode key,
                                 String conditionExpression,
                                 JsonNode exprAttrNames, JsonNode exprAttrValues,
-                                String region) {
+                                String region, String returnValuesOnConditionCheckFailure) {
         String storageKey = regionKey(region, tableName);
         TableDefinition table = tableStore.get(storageKey)
                 .orElseThrow(() -> resourceNotFoundException(tableName));
@@ -285,26 +298,31 @@ public class DynamoDbService {
 
         if (conditionExpression != null) {
             JsonNode existing = items.get(itemKey);
-            evaluateCondition(existing, conditionExpression, exprAttrNames, exprAttrValues);
+            evaluateCondition(existing, conditionExpression, exprAttrNames, exprAttrValues, returnValuesOnConditionCheckFailure);
         }
 
         JsonNode removed = items.remove(itemKey);
         persistItems(storageKey);
         LOG.debugv("Deleted item from {0}: key={1}", tableName, itemKey);
 
-        if (streamService != null && removed != null) {
-            streamService.captureEvent(tableName, "REMOVE", removed, null, table, region);
+        if (removed != null) {
+            if (streamService != null) {
+                streamService.captureEvent(tableName, "REMOVE", removed, null, table, region);
+            }
+            if (kinesisForwarder != null) {
+                kinesisForwarder.forward("REMOVE", removed, null, table, region);
+            }
         }
 
         return removed;
     }
 
     public UpdateResult updateItem(String tableName, JsonNode key, JsonNode attributeUpdates,
-                                    String updateExpression,
-                                    JsonNode expressionAttrNames, JsonNode expressionAttrValues,
-                                    String returnValues) {
+                                String updateExpression,
+                                JsonNode expressionAttrNames, JsonNode expressionAttrValues,
+                                String returnValues) {
         return updateItem(tableName, key, attributeUpdates, updateExpression, expressionAttrNames,
-                          expressionAttrValues, returnValues, null, regionResolver.getDefaultRegion());
+                          expressionAttrValues, returnValues, null, regionResolver.getDefaultRegion(), "NONE");
     }
 
     public UpdateResult updateItem(String tableName, JsonNode key, JsonNode attributeUpdates,
@@ -312,13 +330,14 @@ public class DynamoDbService {
                                     JsonNode expressionAttrNames, JsonNode expressionAttrValues,
                                     String returnValues, String region) {
         return updateItem(tableName, key, attributeUpdates, updateExpression, expressionAttrNames,
-                          expressionAttrValues, returnValues, null, region);
+                          expressionAttrValues, returnValues, null, region, "NONE");
     }
 
     public UpdateResult updateItem(String tableName, JsonNode key, JsonNode attributeUpdates,
                                     String updateExpression,
                                     JsonNode expressionAttrNames, JsonNode expressionAttrValues,
-                                    String returnValues, String conditionExpression, String region) {
+                                    String returnValues, String conditionExpression, String region, 
+                                    String returnValuesOnConditionCheckFailure) {
         String storageKey = regionKey(region, tableName);
         TableDefinition table = tableStore.get(storageKey)
                 .orElseThrow(() -> resourceNotFoundException(tableName));
@@ -330,7 +349,7 @@ public class DynamoDbService {
         JsonNode existing = items.get(itemKey);
 
         if (conditionExpression != null) {
-            evaluateCondition(existing, conditionExpression, expressionAttrNames, expressionAttrValues);
+            evaluateCondition(existing, conditionExpression, expressionAttrNames, expressionAttrValues, returnValuesOnConditionCheckFailure);
         }
 
         ObjectNode item;
@@ -371,6 +390,9 @@ public class DynamoDbService {
         if (streamService != null) {
             streamService.captureEvent(tableName, "MODIFY", existing, item, table, region);
         }
+        if (kinesisForwarder != null) {
+            kinesisForwarder.forward("MODIFY", existing, item, table, region);
+        }
 
         return new UpdateResult(item, existing);
     }
@@ -379,19 +401,19 @@ public class DynamoDbService {
                               JsonNode expressionAttrValues, String keyConditionExpression,
                               String filterExpression, Integer limit) {
         return query(tableName, keyConditions, expressionAttrValues, keyConditionExpression,
-                     filterExpression, limit, null, null, null, regionResolver.getDefaultRegion());
+                     filterExpression, limit, null, null, null, null, regionResolver.getDefaultRegion());
     }
 
     public QueryResult query(String tableName, JsonNode keyConditions,
                               JsonNode expressionAttrValues, String keyConditionExpression,
                               String filterExpression, Integer limit, String region) {
         return query(tableName, keyConditions, expressionAttrValues, keyConditionExpression,
-                     filterExpression, limit, null, null, null, region);
+                     filterExpression, limit, null, null, null, null, region);
     }
 
     public QueryResult query(String tableName, JsonNode keyConditions,
                               JsonNode expressionAttrValues, String keyConditionExpression,
-                              String filterExpression, Integer limit, String indexName,
+                              String filterExpression, Integer limit, Boolean scanIndexForward, String indexName,
                               JsonNode exclusiveStartKey, JsonNode exprAttrNames, String region) {
         String storageKey = regionKey(region, tableName);
         TableDefinition table = tableStore.get(storageKey)
@@ -446,10 +468,15 @@ public class DynamoDbService {
                                           expressionAttrValues, exprAttrNames);
         }
 
-        // Filter out items without GSI key if querying GSI (sparse index)
+        // Filter out items without GSI key attributes (sparse index behavior).
+        // DynamoDB excludes items from a GSI if any key attribute is null/missing.
         if (indexName != null) {
             String finalPkName = pkName;
-            results = results.stream().filter(item -> item.has(finalPkName)).toList();
+            String finalSkName = skName;
+            results = results.stream()
+                    .filter(item -> item.has(finalPkName) && hasNonNullAttribute(item, finalPkName))
+                    .filter(item -> finalSkName == null || (item.has(finalSkName) && hasNonNullAttribute(item, finalSkName)))
+                    .toList();
         }
 
         // Filter out TTL-expired items
@@ -467,6 +494,9 @@ public class DynamoDbService {
                 if (bVal == null) return 1;
                 return compareValues(aVal, bVal);
             });
+            if (Boolean.FALSE.equals(scanIndexForward)) {
+                Collections.reverse(results);
+            }
         }
 
         // Apply ExclusiveStartKey offset
@@ -486,35 +516,37 @@ public class DynamoDbService {
             }
         }
 
-        int scannedCount = results.size();
+        List<JsonNode> evaluatedItems = results;
         JsonNode lastEvaluatedKey = null;
 
-        if (limit != null && limit > 0 && results.size() > limit) {
-            JsonNode lastItem = results.get(limit - 1);
+        if (limit != null && limit > 0 && evaluatedItems.size() > limit) {
+            JsonNode lastItem = evaluatedItems.get(limit - 1);
             lastEvaluatedKey = buildKeyNode(table, lastItem, pkName, skName);
-            results = results.subList(0, limit);
+            evaluatedItems = new ArrayList<>(evaluatedItems.subList(0, limit));
         }
 
-        return new QueryResult(results, scannedCount, lastEvaluatedKey);
+        int scannedCount = evaluatedItems.size();
+
+        if (filterExpression != null) {
+            evaluatedItems = evaluatedItems.stream()
+                    .filter(item -> matchesFilterExpression(item, filterExpression,
+                            exprAttrNames, expressionAttrValues))
+                    .toList();
+        }
+
+        return new QueryResult(evaluatedItems, scannedCount, lastEvaluatedKey);
     }
 
     public ScanResult scan(String tableName, String filterExpression,
                             JsonNode expressionAttrNames, JsonNode expressionAttrValues,
-                            Integer limit, String startKey) {
+                            JsonNode scanFilter, Integer limit, JsonNode exclusiveStartKey) {
         return scan(tableName, filterExpression, expressionAttrNames, expressionAttrValues,
-                    limit, (JsonNode) null, regionResolver.getDefaultRegion());
+                    scanFilter, limit, exclusiveStartKey, regionResolver.getDefaultRegion());
     }
 
     public ScanResult scan(String tableName, String filterExpression,
                             JsonNode expressionAttrNames, JsonNode expressionAttrValues,
-                            Integer limit, String startKey, String region) {
-        return scan(tableName, filterExpression, expressionAttrNames, expressionAttrValues,
-                    limit, (JsonNode) null, region);
-    }
-
-    public ScanResult scan(String tableName, String filterExpression,
-                            JsonNode expressionAttrNames, JsonNode expressionAttrValues,
-                            Integer limit, JsonNode exclusiveStartKey, String region) {
+                            JsonNode scanFilter, Integer limit, JsonNode exclusiveStartKey, String region) {
         String storageKey = regionKey(region, tableName);
         TableDefinition table = tableStore.get(storageKey)
                 .orElseThrow(() -> resourceNotFoundException(tableName));
@@ -538,10 +570,14 @@ public class DynamoDbService {
             if (isExpired(item, table)) {
                 continue;
             }
-            if (filterExpression == null
-                    || matchesFilterExpression(item, filterExpression, expressionAttrNames, expressionAttrValues)) {
-                results.add(item);
+            if (filterExpression != null
+                    && !matchesFilterExpression(item, filterExpression, expressionAttrNames, expressionAttrValues)) {
+                continue;
             }
+            if (scanFilter != null && !matchesScanFilter(item, scanFilter)) {
+                continue;
+            }
+            results.add(item);
         }
 
         JsonNode lastEvaluatedKey = null;
@@ -552,6 +588,20 @@ public class DynamoDbService {
         }
 
         return new ScanResult(results, totalScanned, lastEvaluatedKey);
+    }
+
+    private boolean matchesScanFilter(JsonNode item, JsonNode scanFilter) {
+        Iterator<Map.Entry<String, JsonNode>> fields = scanFilter.fields();
+        while (fields.hasNext()) {
+            var entry = fields.next();
+            String attrName = entry.getKey();
+            JsonNode condition = entry.getValue();
+            JsonNode attrValue = item.get(attrName);
+            if (!matchesKeyCondition(attrValue, condition)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // --- Batch Operations ---
@@ -636,8 +686,9 @@ public class DynamoDbService {
                 String updateExpression = upd.has("UpdateExpression") ? upd.get("UpdateExpression").asText() : null;
                 JsonNode exprAttrNames = upd.has("ExpressionAttributeNames") ? upd.get("ExpressionAttributeNames") : null;
                 JsonNode exprAttrValues = upd.has("ExpressionAttributeValues") ? upd.get("ExpressionAttributeValues") : null;
+                //there is no ConditionExpression, so setting returnValuesOnConditionCheckFailure = "NONE"
                 updateItem(tableName, key, null, updateExpression, exprAttrNames, exprAttrValues,
-                           "NONE", null, region);
+                           "NONE", null, region, "NONE");
             }
             // ConditionCheck-only items are handled in the first pass only
         }
@@ -662,6 +713,8 @@ public class DynamoDbService {
         if (conditionExpression == null) {
             return null;
         }
+        String returnValuesOnConditionCheckFailure = target.has("ReturnValuesOnConditionCheckFailure")
+                ? target.get("ReturnValuesOnConditionCheckFailure").asText() : null;
 
         String tableName = target.path("TableName").asText();
         JsonNode key = transactItem.has("Put") ? target.get("Item") : target.get("Key");
@@ -677,7 +730,7 @@ public class DynamoDbService {
         JsonNode existing = tableItems != null ? tableItems.get(itemKey) : null;
 
         try {
-            evaluateCondition(existing, conditionExpression, exprAttrNames, exprAttrValues);
+            evaluateCondition(existing, conditionExpression, exprAttrNames, exprAttrValues, returnValuesOnConditionCheckFailure);
             return null;
         } catch (AwsException e) {
             return e.getMessage();
@@ -702,6 +755,12 @@ public class DynamoDbService {
     // --- UpdateTable ---
 
     public TableDefinition updateTable(String tableName, Long readCapacity, Long writeCapacity, String region) {
+        return updateTable(tableName, readCapacity, writeCapacity, List.of(), List.of(), List.of(), region);
+    }
+
+    public TableDefinition updateTable(String tableName, Long readCapacity, Long writeCapacity,
+                                        List<GlobalSecondaryIndex> gsiCreates, List<String> gsiDeletes,
+                                        List<AttributeDefinition> newAttrDefs, String region) {
         String storageKey = regionKey(region, tableName);
         TableDefinition table = tableStore.get(storageKey)
                 .orElseThrow(() -> resourceNotFoundException(tableName));
@@ -712,6 +771,27 @@ public class DynamoDbService {
         if (writeCapacity != null) {
             table.getProvisionedThroughput().setWriteCapacityUnits(writeCapacity);
         }
+
+        for (String indexName : gsiDeletes) {
+            table.getGlobalSecondaryIndexes().removeIf(g -> indexName.equals(g.getIndexName()));
+        }
+
+        for (GlobalSecondaryIndex gsi : gsiCreates) {
+            gsi.setIndexArn(table.getTableArn() + "/index/" + gsi.getIndexName());
+            table.getGlobalSecondaryIndexes().add(gsi);
+        }
+
+        if (newAttrDefs != null && !newAttrDefs.isEmpty()) {
+            List<AttributeDefinition> existing = table.getAttributeDefinitions();
+            for (AttributeDefinition newDef : newAttrDefs) {
+                boolean found = existing.stream()
+                        .anyMatch(e -> e.getAttributeName().equals(newDef.getAttributeName()));
+                if (!found) {
+                    existing.add(newDef);
+                }
+            }
+        }
+
         tableStore.put(storageKey, table);
         LOG.infov("Updated table: {0} in region {1}", tableName, region);
         return table;
@@ -727,6 +807,20 @@ public class DynamoDbService {
         table.setTtlEnabled(enabled);
         tableStore.put(storageKey, table);
         LOG.infov("Updated TTL for table {0}: enabled={1}, attr={2}", tableName, enabled, ttlAttributeName);
+    }
+
+    public TableDefinition updateContinuousBackups(String tableName, boolean enabled,
+                                                   Integer recoveryPeriodInDays, String region) {
+        String storageKey = regionKey(region, tableName);
+        TableDefinition table = tableStore.get(storageKey)
+                .orElseThrow(() -> resourceNotFoundException(tableName));
+        table.setPointInTimeRecoveryEnabled(enabled);
+        table.setPointInTimeRecoveryRecoveryPeriodInDays(
+                recoveryPeriodInDays != null ? recoveryPeriodInDays : table.getPointInTimeRecoveryRecoveryPeriodInDays());
+        tableStore.put(storageKey, table);
+        LOG.infov("Updated PITR for table {0}: enabled={1}, recoveryPeriodInDays={2}",
+                tableName, enabled, table.getPointInTimeRecoveryRecoveryPeriodInDays());
+        return table;
     }
 
     static boolean isExpired(JsonNode item, TableDefinition table) {
@@ -760,8 +854,13 @@ public class DynamoDbService {
             String region = storageKey.split("::", 2)[0];
             for (String itemKey : expiredKeys) {
                 JsonNode removed = items.remove(itemKey);
-                if (removed != null && streamService != null) {
-                    streamService.captureEvent(table.getTableName(), "REMOVE", removed, null, table, region);
+                if (removed != null) {
+                    if (streamService != null) {
+                        streamService.captureEvent(table.getTableName(), "REMOVE", removed, null, table, region);
+                    }
+                    if (kinesisForwarder != null) {
+                        kinesisForwarder.forward("REMOVE", removed, null, table, region);
+                    }
                 }
             }
             persistItems(storageKey);
@@ -814,10 +913,14 @@ public class DynamoDbService {
     // --- Condition expression evaluation ---
 
     private void evaluateCondition(JsonNode existingItem, String conditionExpression,
-                                    JsonNode exprAttrNames, JsonNode exprAttrValues) {
+                                    JsonNode exprAttrNames, JsonNode exprAttrValues, String returnValuesOnConditionCheckFailure) {
         if (!matchesFilterExpression(existingItem, conditionExpression, exprAttrNames, exprAttrValues)) {
-            throw new AwsException("ConditionalCheckFailedException",
-                    "The conditional request failed", 400);
+            if ("ALL_OLD".equals(returnValuesOnConditionCheckFailure)){                
+                throw new ConditionalCheckFailedException(existingItem);
+            }
+            else {
+                throw new ConditionalCheckFailedException(null);
+            }
         }
     }
 
@@ -841,8 +944,8 @@ public class DynamoDbService {
                 remaining = remaining.substring(4).trim();
                 remaining = applyAddClause(item, remaining, exprAttrNames, exprAttrValues);
             } else if (upper.startsWith("DELETE ")) {
-                // DELETE is for sets — skip for now
-                break;
+                remaining = remaining.substring(7).trim();
+                remaining = applyDeleteClause(item, remaining, exprAttrNames, exprAttrValues);
             } else {
                 break;
             }
@@ -853,6 +956,8 @@ public class DynamoDbService {
                                    JsonNode exprAttrNames, JsonNode exprAttrValues) {
         // Parse comma-separated assignments: "attr = :val, #name = :val2"
         // Stop when we hit another clause keyword (REMOVE, ADD, DELETE) or end
+        LOG.debugv("applySetClause: clause={0}, exprAttrNames={1}, exprAttrValues={2}",
+                   clause, exprAttrNames, exprAttrValues);
         while (!clause.isEmpty()) {
             String upper = clause.toUpperCase();
             if (upper.startsWith("REMOVE ") || upper.startsWith("ADD ") || upper.startsWith("DELETE ")) {
@@ -869,34 +974,142 @@ public class DynamoDbService {
             String rest = clause.substring(eqIdx + 1).trim();
 
             // Find the value placeholder or expression
+            // IMPORTANT: Check for clause keywords FIRST, then commas
+            // This ensures we don't include REMOVE/ADD/DELETE clauses in value parts
             String valuePart;
+            int nextClause = findNextClauseKeyword(rest);
             int commaIdx = findNextComma(rest);
-            if (commaIdx >= 0) {
+
+            // If there's a clause keyword, use the earlier of comma or keyword
+            if (nextClause >= 0 && (commaIdx < 0 || nextClause < commaIdx)) {
+                valuePart = rest.substring(0, nextClause).trim();
+                rest = rest.substring(nextClause).trim();
+            } else if (commaIdx >= 0) {
                 valuePart = rest.substring(0, commaIdx).trim();
                 rest = rest.substring(commaIdx + 1).trim();
             } else {
-                // Check for next clause keyword
-                int nextClause = findNextClauseKeyword(rest);
-                if (nextClause >= 0) {
-                    valuePart = rest.substring(0, nextClause).trim();
-                    rest = rest.substring(nextClause).trim();
-                } else {
-                    valuePart = rest.trim();
-                    rest = "";
-                }
+                valuePart = rest.trim();
+                rest = "";
             }
 
+
             // Resolve the value
-            if (valuePart.startsWith(":") && exprAttrValues != null) {
+            // Check for arithmetic expressions (operand + operand, operand - operand)
+            // before handling individual expression types, since the left operand can be
+            // a function like if_not_exists(...).
+            int arithmeticIdx = findArithmeticOperator(valuePart);
+            if (arithmeticIdx >= 0) {
+                String leftExpr = valuePart.substring(0, arithmeticIdx).trim();
+                char operator = valuePart.charAt(arithmeticIdx);
+                String rightExpr = valuePart.substring(arithmeticIdx + 1).trim();
+                JsonNode leftVal = evaluateSetExpr(item, leftExpr, exprAttrNames, exprAttrValues);
+                JsonNode rightVal = evaluateSetExpr(item, rightExpr, exprAttrNames, exprAttrValues);
+                if (leftVal == null || rightVal == null || !leftVal.has("N") || !rightVal.has("N")) {
+                    throw new AwsException("ValidationException",
+                            "Invalid UpdateExpression: Incorrect operand type for operator or function", 400);
+                }
+                try {
+                    java.math.BigDecimal left = new java.math.BigDecimal(leftVal.get("N").asText());
+                    java.math.BigDecimal right = new java.math.BigDecimal(rightVal.get("N").asText());
+                    java.math.BigDecimal result = (operator == '+') ? left.add(right) : left.subtract(right);
+                    ObjectNode numNode = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
+                    numNode.put("N", result.toPlainString());
+                    setValueAtPath(item, attrPath, numNode, exprAttrNames);
+                } catch (NumberFormatException e) {
+                    throw new AwsException("ValidationException",
+                            "The parameter cannot be converted to a numeric value", 400);
+                }
+            } else if (valuePart.startsWith("if_not_exists(")) {
+                // if_not_exists(attrRef, fallbackExpr) evaluates to:
+                //   attrRef's current value  — when attrRef exists in the item
+                //   fallbackExpr             — otherwise
+                // The result is always assigned to attrName.
+                String[] args = extractFunctionArgs(valuePart);
+                if (args.length == 2) {
+                    String checkAttr = resolveAttributeName(args[0].trim(), exprAttrNames);
+                    String fallbackExpr = args[1].trim();
+                    JsonNode resolved;
+                    if (hasValueAtPath(item, checkAttr, exprAttrNames)) {
+                        // attrRef exists — evaluate to its current value
+                        resolved = getValueAtPath(item, checkAttr, exprAttrNames);
+                    } else if (fallbackExpr.startsWith(":") && exprAttrValues != null) {
+                        resolved = exprAttrValues.get(fallbackExpr);
+                    } else {
+                        // fallback is itself an attribute reference
+                        resolved = getValueAtPath(item, resolveAttributeName(fallbackExpr, exprAttrNames), exprAttrNames);
+                    }
+                    if (resolved != null) {
+                        setValueAtPath(item, attrPath, resolved, exprAttrNames);
+                    }
+                }
+            } else if (valuePart.toLowerCase().startsWith("list_append(")) {
+                int open = valuePart.indexOf('(');
+                int close = valuePart.lastIndexOf(')');
+                if (open >= 0 && close > open) {
+                    String inner = valuePart.substring(open + 1, close);
+                    int commaPos = findNextComma(inner);
+                    if (commaPos >= 0) {
+                        String arg1 = inner.substring(0, commaPos).trim();
+                        String arg2 = inner.substring(commaPos + 1).trim();
+                        JsonNode list1 = evaluateSetExpr(item, arg1, exprAttrNames, exprAttrValues);
+                        JsonNode list2 = evaluateSetExpr(item, arg2, exprAttrNames, exprAttrValues);
+                        if (list1 != null && list2 != null && list1.has("L") && list2.has("L")) {
+                            com.fasterxml.jackson.databind.node.ArrayNode merged =
+                                    com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.arrayNode();
+                            list1.get("L").forEach(merged::add);
+                            list2.get("L").forEach(merged::add);
+                            com.fasterxml.jackson.databind.node.ObjectNode result =
+                                    com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
+                            result.set("L", merged);
+                            item.set(attrName, result);
+                        }
+                    }
+                }
+            } else if (valuePart.startsWith(":") && exprAttrValues != null) {
                 JsonNode value = exprAttrValues.get(valuePart);
+                LOG.debugv("applySetClause: looked up valuePart={0} in exprAttrValues, got value={1}",
+                           valuePart, value);
                 if (value != null) {
-                    item.set(attrName, value);
+                    setValueAtPath(item, attrPath, value, exprAttrNames);
+                    LOG.debugv("applySetClause: set attrPath={0} to value={1}", attrPath, value);
+                } else {
+                    LOG.debugv("applySetClause: value was null for valuePart={0}, NOT setting attribute", valuePart);
+                }
+            } else if (!valuePart.isEmpty()) {
+                // Plain attribute reference: SET a = b  or  SET a = #alias
+                String refAttr = resolveAttributeName(valuePart, exprAttrNames);
+                JsonNode refValue = getValueAtPath(item, refAttr, exprAttrNames);
+                if (refValue != null) {
+                    setValueAtPath(item, attrPath, refValue, exprAttrNames);
                 }
             }
 
             clause = rest;
         }
         return clause;
+    }
+
+    private JsonNode evaluateSetExpr(ObjectNode item, String expr,
+                                     JsonNode exprAttrNames, JsonNode exprAttrValues) {
+        if (expr.toLowerCase().startsWith("if_not_exists(")) {
+            String[] args = extractFunctionArgs(expr);
+            if (args.length == 2) {
+                String checkAttr = resolveAttributeName(args[0].trim(), exprAttrNames);
+                String fallbackExpr = args[1].trim();
+                if (hasValueAtPath(item, checkAttr, exprAttrNames)) {
+                    return getValueAtPath(item, checkAttr, exprAttrNames);
+                } else if (fallbackExpr.startsWith(":") && exprAttrValues != null) {
+                    return exprAttrValues.get(fallbackExpr);
+                } else {
+                    return getValueAtPath(item, resolveAttributeName(fallbackExpr, exprAttrNames), exprAttrNames);
+                }
+            }
+            return null;
+        } else if (expr.startsWith(":") && exprAttrValues != null) {
+            return exprAttrValues.get(expr);
+        } else {
+            return getValueAtPath(item, resolveAttributeName(expr, exprAttrNames), exprAttrNames);
+        }
     }
 
     private String applyRemoveClause(ObjectNode item, String clause, JsonNode exprAttrNames) {
@@ -906,30 +1119,31 @@ public class DynamoDbService {
                 break;
             }
 
+            // Split on the earlier of the next clause keyword or the next comma.
+            // Prefer the keyword when it comes first so intra-clause commas in a
+            // following clause (e.g. "REMOVE a SET b = :b, c = :c") don't bleed
+            // into this helper's attribute parsing.
             int commaIdx = findNextComma(clause);
+            int nextClause = findNextClauseKeyword(clause);
             String attrPart;
-            if (commaIdx >= 0) {
+            if (nextClause >= 0 && (commaIdx < 0 || nextClause < commaIdx)) {
+                attrPart = clause.substring(0, nextClause).trim();
+                clause = clause.substring(nextClause).trim();
+            } else if (commaIdx >= 0) {
                 attrPart = clause.substring(0, commaIdx).trim();
                 clause = clause.substring(commaIdx + 1).trim();
             } else {
-                int nextClause = findNextClauseKeyword(clause);
-                if (nextClause >= 0) {
-                    attrPart = clause.substring(0, nextClause).trim();
-                    clause = clause.substring(nextClause).trim();
-                } else {
-                    attrPart = clause.trim();
-                    clause = "";
-                }
+                attrPart = clause.trim();
+                clause = "";
             }
 
-            String attrName = resolveAttributeName(attrPart, exprAttrNames);
-            item.remove(attrName);
+            removeValueAtPath(item, attrPart, exprAttrNames);
         }
         return clause;
     }
 
     private String applyAddClause(ObjectNode item, String clause,
-                                   JsonNode exprAttrNames, JsonNode exprAttrValues) {
+                                  JsonNode exprAttrNames, JsonNode exprAttrValues) {
         while (!clause.isEmpty()) {
             String upper = clause.toUpperCase();
             if (upper.startsWith("SET ") || upper.startsWith("REMOVE ") || upper.startsWith("DELETE ")) {
@@ -944,25 +1158,201 @@ public class DynamoDbService {
             String valuePlaceholder = parts[1].replaceAll(",.*", "").trim();
 
             if (valuePlaceholder.startsWith(":") && exprAttrValues != null) {
-                JsonNode value = exprAttrValues.get(valuePlaceholder);
-                if (value != null) {
-                    item.set(attrName, value);
+                JsonNode addValue = exprAttrValues.get(valuePlaceholder);
+                if (addValue != null) {
+                    JsonNode existingValue = item.get(attrName);
+                    JsonNode newValue = applyAddOperation(existingValue, addValue);
+                    item.set(attrName, newValue);
                 }
             }
 
-            // Advance past this assignment
+            // Advance past this assignment. Prefer the next clause keyword when
+            // it precedes the next comma so intra-clause commas in a following
+            // SET (e.g. "ADD a :v SET b = :b, c = :c") don't swallow the keyword.
             int commaIdx = findNextComma(clause);
-            if (commaIdx >= 0) {
+            int nextClause = findNextClauseKeyword(clause);
+            if (nextClause >= 0 && (commaIdx < 0 || nextClause < commaIdx)) {
+                clause = clause.substring(nextClause).trim();
+            } else if (commaIdx >= 0) {
                 clause = clause.substring(commaIdx + 1).trim();
             } else {
-                int nextClause = findNextClauseKeyword(clause);
-                clause = nextClause >= 0 ? clause.substring(nextClause).trim() : "";
+                clause = "";
             }
         }
         return clause;
     }
 
+    /**
+     * Implements DynamoDB ADD operation semantics:
+     * - For numbers (N): adds the value to the existing number, or sets it if attribute doesn't exist
+     * - For sets (SS, NS, BS): adds elements to the existing set, or creates the set if it doesn't exist
+     */
+    private JsonNode applyAddOperation(JsonNode existingValue, JsonNode addValue) {
+        ObjectNode result = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
+
+        // Handle number addition
+        if (addValue.has("N")) {
+            String addNumStr = addValue.get("N").asText();
+            if (existingValue == null || !existingValue.has("N")) {
+                // Attribute doesn't exist — set to the add value
+                return addValue;
+            }
+            // Add the numbers
+            String existingNumStr = existingValue.get("N").asText();
+            try {
+                java.math.BigDecimal existingNum = new java.math.BigDecimal(existingNumStr);
+                java.math.BigDecimal addNum = new java.math.BigDecimal(addNumStr);
+                result.put("N", existingNum.add(addNum).toPlainString());
+                return result;
+            } catch (NumberFormatException e) {
+                // Fall back to just setting the value
+                return addValue;
+            }
+        }
+
+        // Handle string set (SS) addition
+        if (addValue.has("SS")) {
+            if (existingValue == null || !existingValue.has("SS")) {
+                return addValue;
+            }
+            java.util.Set<String> combined = new java.util.LinkedHashSet<>();
+            existingValue.get("SS").forEach(n -> combined.add(n.asText()));
+            addValue.get("SS").forEach(n -> combined.add(n.asText()));
+            var arrayNode = result.putArray("SS");
+            combined.forEach(arrayNode::add);
+            return result;
+        }
+
+        // Handle number set (NS) addition
+        if (addValue.has("NS")) {
+            if (existingValue == null || !existingValue.has("NS")) {
+                return addValue;
+            }
+            java.util.Set<String> combined = new java.util.LinkedHashSet<>();
+            existingValue.get("NS").forEach(n -> combined.add(n.asText()));
+            addValue.get("NS").forEach(n -> combined.add(n.asText()));
+            var arrayNode = result.putArray("NS");
+            combined.forEach(arrayNode::add);
+            return result;
+        }
+
+        // Handle binary set (BS) addition
+        if (addValue.has("BS")) {
+            if (existingValue == null || !existingValue.has("BS")) {
+                return addValue;
+            }
+            java.util.Set<String> combined = new java.util.LinkedHashSet<>();
+            existingValue.get("BS").forEach(n -> combined.add(n.asText()));
+            addValue.get("BS").forEach(n -> combined.add(n.asText()));
+            var arrayNode = result.putArray("BS");
+            combined.forEach(arrayNode::add);
+            return result;
+        }
+
+        // Unsupported type for ADD — just set the value
+        return addValue;
+    }
+
+    private String applyDeleteClause(ObjectNode item, String clause,
+                                     JsonNode exprAttrNames, JsonNode exprAttrValues) {
+        while (!clause.isEmpty()) {
+            String upper = clause.toUpperCase();
+            if (upper.startsWith("SET ") || upper.startsWith("REMOVE ") || upper.startsWith("ADD ") || upper.startsWith("DELETE ")) {
+                break;
+            }
+
+            // Parse "attr :val"
+            String[] parts = clause.split("\\s+", 3);
+            if (parts.length < 2) break;
+
+            String attrName = resolveAttributeName(parts[0], exprAttrNames);
+            String valuePlaceholder = parts[1].replaceAll(",.*", "").trim();
+
+            if (valuePlaceholder.startsWith(":") && exprAttrValues != null) {
+                JsonNode deleteValue = exprAttrValues.get(valuePlaceholder);
+                if (deleteValue != null) {
+                    JsonNode existingValue = item.get(attrName);
+                    if (existingValue != null) {
+                        JsonNode newValue = applyDeleteOperation(existingValue, deleteValue);
+                        if (newValue == null) {
+                            item.remove(attrName);
+                        } else {
+                            item.set(attrName, newValue);
+                        }
+                    }
+                }
+            }
+
+            // Advance past this assignment. Prefer the next clause keyword when
+            // it precedes the next comma so intra-clause commas in a following
+            // SET (e.g. "DELETE s :v SET b = :b, c = :c") don't swallow the keyword.
+            int commaIdx = findNextComma(clause);
+            int nextClause = findNextClauseKeyword(clause);
+            if (nextClause >= 0 && (commaIdx < 0 || nextClause < commaIdx)) {
+                clause = clause.substring(nextClause).trim();
+            } else if (commaIdx >= 0) {
+                clause = clause.substring(commaIdx + 1).trim();
+            } else {
+                clause = "";
+            }
+        }
+        return clause;
+    }
+
+    /**
+     * Implements DynamoDB DELETE operation semantics:
+     * removes the specified elements from a set attribute (SS, NS, BS).
+     * Returns null if the resulting set is empty (caller should remove the attribute).
+     * Returns the existing value unchanged if types don't match or the value isn't a set.
+     */
+    private JsonNode applyDeleteOperation(JsonNode existingValue, JsonNode deleteValue) {
+        ObjectNode result = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
+
+        if (deleteValue.has("SS") && existingValue.has("SS")) {
+            java.util.Set<String> toRemove = new java.util.LinkedHashSet<>();
+            deleteValue.get("SS").forEach(n -> toRemove.add(n.asText()));
+            java.util.List<String> remaining = new java.util.ArrayList<>();
+            existingValue.get("SS").forEach(n -> {
+                if (!toRemove.contains(n.asText())) remaining.add(n.asText());
+            });
+            if (remaining.isEmpty()) return null;
+            var arrayNode = result.putArray("SS");
+            remaining.forEach(arrayNode::add);
+            return result;
+        }
+
+        if (deleteValue.has("NS") && existingValue.has("NS")) {
+            java.util.Set<String> toRemove = new java.util.LinkedHashSet<>();
+            deleteValue.get("NS").forEach(n -> toRemove.add(n.asText()));
+            java.util.List<String> remaining = new java.util.ArrayList<>();
+            existingValue.get("NS").forEach(n -> {
+                if (!toRemove.contains(n.asText())) remaining.add(n.asText());
+            });
+            if (remaining.isEmpty()) return null;
+            var arrayNode = result.putArray("NS");
+            remaining.forEach(arrayNode::add);
+            return result;
+        }
+
+        if (deleteValue.has("BS") && existingValue.has("BS")) {
+            java.util.Set<String> toRemove = new java.util.LinkedHashSet<>();
+            deleteValue.get("BS").forEach(n -> toRemove.add(n.asText()));
+            java.util.List<String> remaining = new java.util.ArrayList<>();
+            existingValue.get("BS").forEach(n -> {
+                if (!toRemove.contains(n.asText())) remaining.add(n.asText());
+            });
+            if (remaining.isEmpty()) return null;
+            var arrayNode = result.putArray("BS");
+            remaining.forEach(arrayNode::add);
+            return result;
+        }
+
+        // DELETE on non-set types or mismatched set types is a no-op per DynamoDB spec
+        return existingValue;
+    }
+
     String resolveAttributeName(String nameOrPlaceholder, JsonNode exprAttrNames) {
+        nameOrPlaceholder = nameOrPlaceholder.trim();
         if (nameOrPlaceholder.startsWith("#") && exprAttrNames != null) {
             JsonNode resolved = exprAttrNames.get(nameOrPlaceholder);
             if (resolved != null) {
@@ -970,6 +1360,134 @@ public class DynamoDbService {
             }
         }
         return nameOrPlaceholder;
+    }
+
+    /**
+     * Sets a value at a potentially nested attribute path.
+     * Supports paths like "attr", "parent.child", "#alias.nested" etc.
+     * For nested paths, navigates into the DynamoDB Map structure (M field).
+     */
+    private void setValueAtPath(ObjectNode item, String path, JsonNode value, JsonNode exprAttrNames) {
+        // Resolve any # placeholders in the path segments
+        String[] segments = path.split("\\.");
+        for (int i = 0; i < segments.length; i++) {
+            segments[i] = resolveAttributeName(segments[i].trim(), exprAttrNames);
+        }
+
+        if (segments.length == 1) {
+            // Simple top-level attribute
+            item.set(segments[0], value);
+            return;
+        }
+
+        // Navigate to the parent of the target attribute
+        ObjectNode current = item;
+        for (int i = 0; i < segments.length - 1; i++) {
+            String segment = segments[i];
+            JsonNode child = current.get(segment);
+
+            if (child == null || !child.has("M")) {
+                // Create nested map structure if it doesn't exist
+                ObjectNode newMap = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
+                ObjectNode wrapper = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
+                wrapper.set("M", newMap);
+                current.set(segment, wrapper);
+                current = newMap;
+            } else {
+                // Navigate into existing map
+                JsonNode mapContent = child.get("M");
+                if (mapContent instanceof ObjectNode) {
+                    current = (ObjectNode) mapContent;
+                } else {
+                    // Cannot navigate further, structure mismatch
+                    return;
+                }
+            }
+        }
+
+        // Set the final attribute
+        current.set(segments[segments.length - 1], value);
+    }
+
+    /**
+     * Gets a value at a potentially nested attribute path.
+     * Returns null if the path doesn't exist.
+     */
+    private JsonNode getValueAtPath(JsonNode item, String path, JsonNode exprAttrNames) {
+        // Resolve any # placeholders in the path segments
+        String[] segments = path.split("\\.");
+        for (int i = 0; i < segments.length; i++) {
+            segments[i] = resolveAttributeName(segments[i].trim(), exprAttrNames);
+        }
+
+        JsonNode current = item;
+        for (int i = 0; i < segments.length; i++) {
+            if (current == null) return null;
+
+            String segment = segments[i];
+            JsonNode child = current.get(segment);
+
+            if (child == null) return null;
+
+            if (i < segments.length - 1) {
+                // Need to navigate deeper - check for Map structure
+                if (child.has("M")) {
+                    current = child.get("M");
+                } else {
+                    return null;
+                }
+            } else {
+                // This is the final segment
+                return child;
+            }
+        }
+        return current;
+    }
+
+    /**
+     * Checks if a value exists at a potentially nested attribute path.
+     */
+    private boolean hasValueAtPath(JsonNode item, String path, JsonNode exprAttrNames) {
+        return getValueAtPath(item, path, exprAttrNames) != null;
+    }
+
+    /**
+     * Removes a value at a potentially nested attribute path.
+     * Supports paths like "attr", "parent.child", "#alias.nested" etc.
+     * For nested paths, navigates into the DynamoDB Map structure (M field)
+     * and removes the final key from its parent.
+     */
+    private void removeValueAtPath(ObjectNode item, String path, JsonNode exprAttrNames) {
+        String[] segments = path.split("\\.");
+        for (int i = 0; i < segments.length; i++) {
+            segments[i] = resolveAttributeName(segments[i].trim(), exprAttrNames);
+        }
+
+        if (segments.length == 1) {
+            item.remove(segments[0]);
+            return;
+        }
+
+        // Navigate to the parent of the target attribute
+        ObjectNode current = item;
+        for (int i = 0; i < segments.length - 1; i++) {
+            String segment = segments[i];
+            JsonNode child = current.get(segment);
+
+            if (child == null || !child.has("M")) {
+                // Path doesn't exist, nothing to remove
+                return;
+            }
+
+            JsonNode mapContent = child.get("M");
+            if (mapContent instanceof ObjectNode) {
+                current = (ObjectNode) mapContent;
+            } else {
+                return;
+            }
+        }
+
+        current.remove(segments[segments.length - 1]);
     }
 
     private int findNextComma(String s) {
@@ -1003,105 +1521,46 @@ public class DynamoDbService {
     }
 
     private int indexOfKeyword(String upper, String keyword) {
-        int idx = upper.indexOf(keyword);
-        // Ensure it's at word boundary (start of string or preceded by space)
-        if (idx > 0 && upper.charAt(idx - 1) != ' ') return -1;
-        return idx;
+        // Find the next occurrence of keyword at a word boundary (start of string
+        // or preceded by whitespace). Loop past non-boundary hits so attribute
+        // names that contain a keyword as a substring (e.g. "oldSET" before a
+        // real "SET " clause) don't shadow a later valid match.
+        //
+        // Go AWS SDK v2 expression.Builder emits newline-separated clauses, so
+        // the boundary check accepts any whitespace (space, tab, CR, LF), not
+        // just literal space.
+        int from = 0;
+        while (from <= upper.length()) {
+            int idx = upper.indexOf(keyword, from);
+            if (idx < 0) return -1;
+            if (idx == 0 || Character.isWhitespace(upper.charAt(idx - 1))) return idx;
+            from = idx + 1;
+        }
+        return -1;
     }
 
     // --- Filter expression evaluation ---
 
     private boolean matchesFilterExpression(JsonNode item, String filterExpression,
                                              JsonNode exprAttrNames, JsonNode exprAttrValues) {
-        // Handle AND/OR combined expressions
-        // Split on AND first (simple approach — handles most common cases)
-        String[] andParts = filterExpression.split("\\s+[Aa][Nn][Dd]\\s+");
-        for (String part : andParts) {
-            if (!evaluateSingleCondition(item, part.trim(), exprAttrNames, exprAttrValues)) {
-                return false;
-            }
-        }
-        return true;
+        return ExpressionEvaluator.matches(filterExpression, item, exprAttrNames, exprAttrValues);
     }
 
-    private boolean evaluateSingleCondition(JsonNode item, String condition,
-                                             JsonNode exprAttrNames, JsonNode exprAttrValues) {
-        // Parse: "attrPath = :val", "attrPath <> :val", "attrPath > :val", etc.
-        // Also: "attribute_exists(attrPath)", "attribute_not_exists(attrPath)",
-        //        "begins_with(attrPath, :val)", "contains(attrPath, :val)"
-        String condLower = condition.toLowerCase();
-
-        if (condLower.startsWith("attribute_exists")) {
-            String attr = extractFunctionArg(condition);
-            String attrName = resolveAttributeName(attr, exprAttrNames);
-            // If item is null, attribute cannot exist
-            return item != null && item.has(attrName);
-        }
-        if (condLower.startsWith("attribute_not_exists")) {
-            String attr = extractFunctionArg(condition);
-            String attrName = resolveAttributeName(attr, exprAttrNames);
-            // If item is null, attribute definitely doesn't exist
-            return item == null || !item.has(attrName);
-        }
-        if (condLower.startsWith("begins_with")) {
-            String[] args = extractFunctionArgs(condition);
-            if (args.length == 2) {
-                String attrName = resolveAttributeName(args[0], exprAttrNames);
-                String prefix = resolveExprValue(args[1], exprAttrValues);
-                String actual = item != null ? extractScalarValue(item.get(attrName)) : null;
-                return actual != null && prefix != null && actual.startsWith(prefix);
-            }
-            return false;
-        }
-        if (condLower.startsWith("contains")) {
-            String[] args = extractFunctionArgs(condition);
-            if (args.length == 2) {
-                String attrName = resolveAttributeName(args[0], exprAttrNames);
-                String substring = resolveExprValue(args[1], exprAttrValues);
-                String actual = item != null ? extractScalarValue(item.get(attrName)) : null;
-                return actual != null && substring != null && actual.contains(substring);
-            }
-            return false;
-        }
-
-        // Comparison operators: =, <>, <, <=, >, >=
-        String[] operators = {"<>", "<=", ">=", "=", "<", ">"};
-        for (String op : operators) {
-            int opIdx = condition.indexOf(op);
-            if (opIdx > 0) {
-                String left = condition.substring(0, opIdx).trim();
-                String right = condition.substring(opIdx + op.length()).trim();
-
-                String attrName = resolveAttributeName(left, exprAttrNames);
-                String expected = resolveExprValue(right, exprAttrValues);
-                String actual = item != null ? extractScalarValue(item.get(attrName)) : null;
-
-                if (actual == null || expected == null) return false;
-
-                return switch (op) {
-                    case "=" -> actual.equals(expected);
-                    case "<>" -> !actual.equals(expected);
-                    case "<" -> compareValues(actual, expected) < 0;
-                    case "<=" -> compareValues(actual, expected) <= 0;
-                    case ">" -> compareValues(actual, expected) > 0;
-                    case ">=" -> compareValues(actual, expected) >= 0;
-                    default -> false;
-                };
-            }
-        }
-
-        return true; // Unknown condition — pass through
+    private boolean attributeValuesEqual(JsonNode a, JsonNode b) {
+        return ExpressionEvaluator.attributeValuesEqual(a, b);
     }
 
-    private String resolveExprValue(String placeholder, JsonNode exprAttrValues) {
-        if (placeholder.startsWith(":") && exprAttrValues != null) {
-            return extractScalarValue(exprAttrValues.get(placeholder));
-        }
-        return placeholder;
+    /**
+     * Returns true if the item has the given attribute with a non-null DynamoDB value.
+     * An attribute is considered null if it is the DynamoDB NULL type ({@code {"NULL": true}}).
+     */
+    private static boolean hasNonNullAttribute(JsonNode item, String attrName) {
+        JsonNode attr = item.get(attrName);
+        if (attr == null) return false;
+        return !attr.has("NULL");
     }
 
     private int compareValues(String a, String b) {
-        // Try numeric comparison first
         try {
             return Double.compare(Double.parseDouble(a), Double.parseDouble(b));
         } catch (NumberFormatException e) {
@@ -1109,13 +1568,26 @@ public class DynamoDbService {
         }
     }
 
-    private String extractFunctionArg(String funcCall) {
-        int open = funcCall.indexOf('(');
-        int close = funcCall.lastIndexOf(')');
-        if (open >= 0 && close > open) {
-            return funcCall.substring(open + 1, close).trim();
+    /**
+     * Finds the index of an arithmetic operator (+ or -) that is outside
+     * function parentheses. Returns -1 if none found.
+     */
+    private int findArithmeticOperator(String expr) {
+        int depth = 0;
+        for (int i = 0; i < expr.length(); i++) {
+            char c = expr.charAt(i);
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+            } else if (depth == 0 && (c == '+' || c == '-')) {
+                // Ensure this is a binary operator, not a sign at the start or after '('
+                if (i > 0) {
+                    return i;
+                }
+            }
         }
-        return funcCall;
+        return -1;
     }
 
     private String[] extractFunctionArgs(String funcCall) {
@@ -1150,9 +1622,11 @@ public class DynamoDbService {
         String skName = table.getSortKeyName();
         if (skName != null) {
             JsonNode skAttr = item.get(skName);
-            if (skAttr != null) {
-                return pk + "#" + extractScalarValue(skAttr);
+            if (skAttr == null) {
+                throw new AwsException("ValidationException",
+                        "One of the required keys was not given a value", 400);
             }
+            return pk + "#" + extractScalarValue(skAttr);
         }
         return pk;
     }
@@ -1191,6 +1665,7 @@ public class DynamoDbService {
         if (attrValue.has("S")) return attrValue.get("S").asText();
         if (attrValue.has("N")) return attrValue.get("N").asText();
         if (attrValue.has("B")) return attrValue.get("B").asText();
+        if (attrValue.has("BOOL")) return attrValue.get("BOOL").asText();
         return attrValue.asText();
     }
 
@@ -1209,6 +1684,7 @@ public class DynamoDbService {
         return null;
     }
 
+    // NE, CONTAINS, NOT_CONTAINS, IN, NULL, NOT_NULL not yet supported
     private boolean matchesKeyCondition(JsonNode attrValue, JsonNode condition) {
         if (condition == null) return true;
         String op = condition.has("ComparisonOperator") ? condition.get("ComparisonOperator").asText() : "EQ";
@@ -1243,17 +1719,30 @@ public class DynamoDbService {
                                                 JsonNode exprAttrNames) {
         List<JsonNode> results = new ArrayList<>();
 
-        // Parse simple expressions: "pk = :val" or "pk = :val AND sk begins_with :prefix"
-        String[] parts = expression.split("\\s+[Aa][Nn][Dd]\\s+", 2);
-        String pkExpression = parts[0].trim();
-        String skExpression = parts.length > 1 ? parts[1].trim() : null;
+        // Use token-based splitting that correctly handles BETWEEN...AND and compact format
+        String[] keyParts = ExpressionEvaluator.splitKeyCondition(expression);
+        String pkExpression = keyParts[0];
+        String skExpression = keyParts[1];
 
         // Extract pk attr name from expression (may use #alias)
-        String pkAttrInExpr = pkExpression.split("\\s*=\\s*")[0].trim();
+        // Strip outer parens for PK extraction (e.g. "(#f0 = :v0)" → "#f0 = :v0")
+        String pkExprStripped = pkExpression.trim();
+        while (pkExprStripped.startsWith("(") && pkExprStripped.endsWith(")")) {
+            pkExprStripped = pkExprStripped.substring(1, pkExprStripped.length() - 1).trim();
+        }
+        String pkAttrInExpr = pkExprStripped.split("\\s*=\\s*")[0].trim();
         String resolvedPkName = resolveAttributeName(pkAttrInExpr, exprAttrNames);
 
-        // Extract pk value
-        String pkPlaceholder = extractPlaceholder(pkExpression);
+        // Extract pk value placeholder
+        int colonIdx = pkExprStripped.indexOf(':');
+        String pkPlaceholder = null;
+        if (colonIdx >= 0) {
+            int end = colonIdx + 1;
+            while (end < pkExprStripped.length() && (Character.isLetterOrDigit(pkExprStripped.charAt(end)) || pkExprStripped.charAt(end) == '_')) {
+                end++;
+            }
+            pkPlaceholder = pkExprStripped.substring(colonIdx, end);
+        }
         String pkValue = pkPlaceholder != null && expressionAttrValues != null
                 ? extractScalarValue(expressionAttrValues.get(pkPlaceholder))
                 : null;
@@ -1265,7 +1754,7 @@ public class DynamoDbService {
             }
 
             if (skExpression != null && skName != null) {
-                if (!matchesSkExpression(item.get(skName), skExpression, expressionAttrValues)) {
+                if (!ExpressionEvaluator.matches(skExpression, item, exprAttrNames, expressionAttrValues)) {
                     continue;
                 }
             }
@@ -1274,53 +1763,6 @@ public class DynamoDbService {
         }
 
         return results;
-    }
-
-    private boolean matchesSkExpression(JsonNode skValue, String expression, JsonNode exprValues) {
-        String actual = extractScalarValue(skValue);
-        if (actual == null) return false;
-
-        String exprLower = expression.toLowerCase();
-        if (exprLower.contains("begins_with")) {
-            String placeholder = extractPlaceholder(expression);
-            String prefix = placeholder != null && exprValues != null
-                    ? extractScalarValue(exprValues.get(placeholder)) : null;
-            return prefix != null && actual.startsWith(prefix);
-        }
-
-        // Detect comparison operator
-        String[] operators = {"<>", "<=", ">=", "=", "<", ">"};
-        for (String op : operators) {
-            int opIdx = expression.indexOf(op);
-            if (opIdx > 0) {
-                String right = expression.substring(opIdx + op.length()).trim();
-                String placeholder = right.startsWith(":") ? right.split("\\s+")[0] : null;
-                String expected = placeholder != null && exprValues != null
-                        ? extractScalarValue(exprValues.get(placeholder)) : null;
-                if (expected == null) return false;
-                return switch (op) {
-                    case "=" -> actual.equals(expected);
-                    case "<>" -> !actual.equals(expected);
-                    case ">=" -> actual.compareTo(expected) >= 0;
-                    case "<=" -> actual.compareTo(expected) <= 0;
-                    case ">" -> actual.compareTo(expected) > 0;
-                    case "<" -> actual.compareTo(expected) < 0;
-                    default -> true;
-                };
-            }
-        }
-        return true;
-    }
-
-    private String extractPlaceholder(String expression) {
-        // Find :placeholder in expression
-        int idx = expression.indexOf(':');
-        if (idx < 0) return null;
-        int end = idx + 1;
-        while (end < expression.length() && (Character.isLetterOrDigit(expression.charAt(end)) || expression.charAt(end) == '_')) {
-            end++;
-        }
-        return expression.substring(idx, end);
     }
 
     private AwsException resourceNotFoundException(String tableName) {

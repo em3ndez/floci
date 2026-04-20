@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.lambda.model.EventSourceMapping;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
@@ -17,7 +18,9 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -70,7 +73,7 @@ public class SqsEventSourcePoller {
     void init() {
         List<EventSourceMapping> esms = esmStore.list();
         for (EventSourceMapping esm : esms) {
-            if (esm.isEnabled()) {
+            if (esm.isEnabled() && esm.getEventSourceArn().contains(":sqs:")) {
                 startPolling(esm);
             }
         }
@@ -144,13 +147,27 @@ public class SqsEventSourcePoller {
 
                 String eventJson = buildSqsEvent(messages, esm);
                 LOG.infov("ESM {0}: invoking function {1}", esm.getUuid(), fn.getFunctionName());
-                InvokeResult result = executorService.invoke(
-                        fn, eventJson.getBytes(), InvocationType.RequestResponse);
+                InvokeResult result;
+                try {
+                    result = executorService.invoke(
+                            fn, eventJson.getBytes(), InvocationType.RequestResponse);
+                } catch (AwsException e) {
+                    if ("TooManyRequestsException".equals(e.getErrorCode())) {
+                        LOG.infov("ESM {0}: function {1} throttled, messages will return to queue after visibility timeout",
+                                esm.getUuid(), fn.getFunctionName());
+                        return;
+                    }
+                    throw e;
+                }
 
                 if (result.getFunctionError() == null) {
-                    LOG.infov("ESM {0}: Lambda succeeded, deleting {1} message(s)",
-                            esm.getUuid(), messages.size());
-                    for (Message msg : messages) {
+                    Set<String> failedIds = extractBatchItemFailures(esm, result);
+                    List<Message> toDelete = failedIds.isEmpty()
+                            ? messages
+                            : messages.stream().filter(m -> !failedIds.contains(m.getMessageId())).toList();
+                    LOG.infov("ESM {0}: Lambda succeeded, deleting {1} of {2} message(s) ({3} reported as failed)",
+                            esm.getUuid(), toDelete.size(), messages.size(), failedIds.size());
+                    for (Message msg : toDelete) {
                         try {
                             sqsService.deleteMessage(esm.getQueueUrl(),
                                     msg.getReceiptHandle(), esm.getRegion());
@@ -170,6 +187,31 @@ public class SqsEventSourcePoller {
                 activePolls.remove(esm.getUuid());
             }
         });
+    }
+
+    private Set<String> extractBatchItemFailures(EventSourceMapping esm, InvokeResult result) {
+        if (!esm.isReportBatchItemFailures() || result.getPayload() == null || result.getPayload().length == 0) {
+            return Set.of();
+        }
+        try {
+            var root = objectMapper.readTree(result.getPayload());
+            var failures = root.get("batchItemFailures");
+            if (failures == null || !failures.isArray()) {
+                return Set.of();
+            }
+            Set<String> failedIds = new HashSet<>();
+            for (var item : failures) {
+                var id = item.get("itemIdentifier");
+                if (id != null && !id.isNull()) {
+                    failedIds.add(id.asText());
+                }
+            }
+            return failedIds;
+        } catch (Exception e) {
+            LOG.warnv("ESM {0}: failed to parse batchItemFailures from Lambda response: {1}",
+                    esm.getUuid(), e.getMessage());
+            return Set.of();
+        }
     }
 
     private String buildSqsEvent(List<Message> messages, EventSourceMapping esm) {

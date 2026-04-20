@@ -25,40 +25,45 @@
 | `TagResource` | Tag a key |
 | `UntagResource` | Remove tags |
 | `ListResourceTags` | List tags |
+| `GetKeyPolicy` | Get a key's resource policy |
+| `PutKeyPolicy` | Update a key's resource policy |
+| `GetKeyRotationStatus` | Check if automatic key rotation is enabled |
+| `EnableKeyRotation` | Enable automatic key rotation (symmetric keys only) |
+| `DisableKeyRotation` | Disable automatic key rotation |
 
 ## Examples
 
 ```bash
-export AWS_ENDPOINT=http://localhost:4566
+export AWS_ENDPOINT_URL=http://localhost:4566
 
 # Create a symmetric key
 KEY_ID=$(aws kms create-key \
   --description "My encryption key" \
   --query KeyMetadata.KeyId --output text \
-  --endpoint-url $AWS_ENDPOINT)
+  --endpoint-url $AWS_ENDPOINT_URL)
 
 # Create an alias
 aws kms create-alias \
   --alias-name alias/my-key \
   --target-key-id $KEY_ID \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Encrypt
 CIPHER=$(aws kms encrypt \
   --key-id alias/my-key \
   --plaintext "Hello, World!" \
   --query CiphertextBlob --output text \
-  --endpoint-url $AWS_ENDPOINT)
+  --endpoint-url $AWS_ENDPOINT_URL)
 
 # Decrypt
 aws kms decrypt \
   --ciphertext-blob $CIPHER \
   --query Plaintext --output text \
-  --endpoint-url $AWS_ENDPOINT | base64 --decode
+  --endpoint-url $AWS_ENDPOINT_URL | base64 --decode
 
 # Generate a data key (envelope encryption)
 aws kms generate-data-key \
   --key-id alias/my-key \
   --key-spec AES_256 \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 ```

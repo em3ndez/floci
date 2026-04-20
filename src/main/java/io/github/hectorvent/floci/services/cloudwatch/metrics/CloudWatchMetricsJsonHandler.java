@@ -14,7 +14,9 @@ import jakarta.ws.rs.core.Response;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Handles CloudWatch Metrics requests via the JSON 1.0 protocol.
@@ -33,7 +35,8 @@ public class CloudWatchMetricsJsonHandler {
     }
 
     public Response handle(String action, JsonNode request, String region) {
-        return switch (action) {
+        String normalizedAction = action.substring(0, 1).toUpperCase() + action.substring(1);
+        return switch (normalizedAction) {
             case "PutMetricData" -> handlePutMetricData(request, region);
             case "ListMetrics" -> handleListMetrics(request, region);
             case "GetMetricStatistics" -> handleGetMetricStatistics(request, region);
@@ -41,9 +44,12 @@ public class CloudWatchMetricsJsonHandler {
             case "DescribeAlarms" -> handleDescribeAlarms(request, region);
             case "DeleteAlarms" -> handleDeleteAlarms(request, region);
             case "SetAlarmState" -> handleSetAlarmState(request, region);
-            case "GetMetricData" -> Response.ok(objectMapper.createObjectNode().putArray("MetricDataResults")).build();
+            case "ListTagsForResource" -> handleListTagsForResource(request, region);
+            case "TagResource" -> handleTagResource(request, region);
+            case "UntagResource" -> handleUntagResource(request, region);
+            case "GetMetricData" -> handleGetMetricData(request, region);
             default -> Response.status(400)
-                    .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported."))
+                    .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported by CloudWatch JSON."))
                     .build();
         };
     }
@@ -139,6 +145,13 @@ public class CloudWatchMetricsJsonHandler {
             okActions.forEach(a -> alarm.getOkActions().add(a.asText()));
         }
 
+        JsonNode tagsNode = request.has("Tags") ? request.path("Tags") : request.path("tags");
+        if (tagsNode.isArray()) {
+            Map<String, String> tags = new LinkedHashMap<>();
+            tagsNode.forEach(t -> tags.put(t.path("Key").asText(), t.path("Value").asText()));
+            alarm.setTags(tags);
+        }
+
         metricsService.putMetricAlarm(alarm, region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
@@ -192,6 +205,99 @@ public class CloudWatchMetricsJsonHandler {
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
+    private Response handleListTagsForResource(JsonNode request, String region) {
+        String arn = request.has("ResourceARN") ? request.path("ResourceARN").asText() : request.path("ResourceArn").asText();
+        if (arn.isEmpty()) arn = request.path("resourceArn").asText();
+
+        Map<String, String> tags = metricsService.listTagsForResource(arn, region);
+        ArrayNode tagsArray = objectMapper.createArrayNode();
+        tags.forEach((k, v) -> tagsArray.addObject().put("Key", k).put("Value", v));
+        return Response.ok(objectMapper.createObjectNode().set("Tags", tagsArray)).build();
+    }
+
+    private Response handleTagResource(JsonNode request, String region) {
+        String arn = request.has("ResourceARN") ? request.path("ResourceARN").asText() : request.path("ResourceArn").asText();
+        if (arn.isEmpty()) arn = request.path("resourceArn").asText();
+
+        Map<String, String> tags = new LinkedHashMap<>();
+        JsonNode tagsNode = request.has("Tags") ? request.path("Tags") : request.path("tags");
+        if (tagsNode.isArray()) {
+            tagsNode.forEach(t -> tags.put(t.path("Key").asText(), t.path("Value").asText()));
+        }
+        metricsService.tagResource(arn, tags, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleUntagResource(JsonNode request, String region) {
+        String arn = request.has("ResourceARN") ? request.path("ResourceARN").asText() : request.path("ResourceArn").asText();
+        if (arn.isEmpty()) arn = request.path("resourceArn").asText();
+
+        List<String> keys = new ArrayList<>();
+        JsonNode keysNode = request.has("TagKeys") ? request.path("TagKeys") : request.path("tagKeys");
+        if (keysNode.isArray()) {
+            keysNode.forEach(k -> keys.add(k.asText()));
+        }
+        metricsService.untagResource(arn, keys, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleGetMetricData(JsonNode request, String region) {
+        Instant startTime = parseInstantNode(request.path("StartTime"));
+        Instant endTime = parseInstantNode(request.path("EndTime"));
+
+        List<CloudWatchMetricsService.MetricDataQuery> queries = new ArrayList<>();
+        JsonNode queriesNode = request.path("MetricDataQueries");
+        if (queriesNode.isArray()) {
+            for (JsonNode qNode : queriesNode) {
+                String id = qNode.path("Id").asText();
+                String expression = qNode.has("Expression") ? qNode.path("Expression").asText() : null;
+                String label = qNode.has("Label") ? qNode.path("Label").asText() : null;
+                boolean returnData = qNode.path("ReturnData").asBoolean(true);
+
+                CloudWatchMetricsService.MetricStat metricStat = null;
+                JsonNode msNode = qNode.path("MetricStat");
+                if (!msNode.isMissingNode()) {
+                    JsonNode metricNode = msNode.path("Metric");
+                    String namespace = metricNode.path("Namespace").asText();
+                    String metricName = metricNode.path("MetricName").asText();
+                    int period = msNode.path("Period").asInt(60);
+                    String stat = msNode.path("Stat").asText();
+                    String unit = msNode.has("Unit") ? msNode.path("Unit").asText() : null;
+                    List<Dimension> dims = parseDimensionsJson(metricNode.path("Dimensions"));
+
+                    metricStat = new CloudWatchMetricsService.MetricStat(
+                            namespace, metricName, dims, period, stat, unit);
+                }
+
+                queries.add(new CloudWatchMetricsService.MetricDataQuery(
+                        id, metricStat, expression, label, returnData));
+            }
+        }
+
+        List<CloudWatchMetricsService.MetricDataResult> results =
+                metricsService.getMetricData(queries, startTime, endTime, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode resultsArray = response.putArray("MetricDataResults");
+        for (var r : results) {
+            ObjectNode rNode = resultsArray.addObject();
+            rNode.put("Id", r.id());
+            rNode.put("Label", r.label());
+            rNode.put("StatusCode", r.statusCode());
+
+            ArrayNode tsArray = rNode.putArray("Timestamps");
+            for (Instant ts : r.timestamps()) {
+                tsArray.add(ts.getEpochSecond());
+            }
+
+            ArrayNode valArray = rNode.putArray("Values");
+            for (Double v : r.values()) {
+                valArray.add(v);
+            }
+        }
+        return Response.ok(response).build();
+    }
+
     private List<MetricDatum> parseMetricDataJson(JsonNode node) {
         List<MetricDatum> datums = new ArrayList<>();
         if (!node.isArray()) return datums;
@@ -206,6 +312,15 @@ public class CloudWatchMetricsJsonHandler {
                 if (parsed != null) datum.setTimestamp(parsed.getEpochSecond());
             }
             datum.setDimensions(parseDimensionsJson(item.path("Dimensions")));
+
+            JsonNode statsValues = item.path("StatisticValues");
+            if (!statsValues.isMissingNode()) {
+                datum.setSampleCount(statsValues.path("SampleCount").asDouble(0));
+                datum.setSum(statsValues.path("Sum").asDouble(0));
+                datum.setMinimum(statsValues.path("Minimum").asDouble(0));
+                datum.setMaximum(statsValues.path("Maximum").asDouble(0));
+            }
+            
             datums.add(datum);
         }
         return datums;
@@ -218,6 +333,15 @@ public class CloudWatchMetricsJsonHandler {
             dims.add(new Dimension(d.path("Name").asText(), d.path("Value").asText()));
         }
         return dims;
+    }
+
+    /** Parse a JsonNode that may be a numeric epoch (long/double) or an ISO-8601 string. */
+    private Instant parseInstantNode(JsonNode node) {
+        if (node == null || node.isMissingNode() || node.isNull()) return null;
+        if (node.isNumber()) {
+            return Instant.ofEpochSecond(node.asLong());
+        }
+        return parseInstant(node.asText(null));
     }
 
     private Instant parseInstant(String value) {

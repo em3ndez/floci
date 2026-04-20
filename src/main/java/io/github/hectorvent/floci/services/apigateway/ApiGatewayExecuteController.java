@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.*;
@@ -22,9 +23,11 @@ import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 /**
  * Executes API Gateway stage requests, routing them through the configured
@@ -35,6 +38,7 @@ import java.util.UUID;
  * <p>This mirrors the real AWS execute-api URL format:
  * {@code https://{apiId}.execute-api.{region}.amazonaws.com/{stageName}/{path}}
  */
+@ApplicationScoped
 @Path("/execute-api/{apiId}/{stageName}")
 @Produces(MediaType.WILDCARD)
 public class ApiGatewayExecuteController {
@@ -46,16 +50,21 @@ public class ApiGatewayExecuteController {
     private final LambdaService lambdaService;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
+    private final VtlTemplateEngine vtlEngine;
+    private final AwsServiceRouter serviceRouter;
 
     @Inject
     public ApiGatewayExecuteController(ApiGatewayService apiGatewayService, ApiGatewayV2Service apiGatewayV2Service,
                                        LambdaService lambdaService, RegionResolver regionResolver,
-                                       ObjectMapper objectMapper) {
+                                       ObjectMapper objectMapper, VtlTemplateEngine vtlEngine,
+                                       AwsServiceRouter serviceRouter) {
         this.apiGatewayService = apiGatewayService;
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.lambdaService = lambdaService;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
+        this.vtlEngine = vtlEngine;
+        this.serviceRouter = serviceRouter;
     }
 
     @GET
@@ -108,7 +117,7 @@ public class ApiGatewayExecuteController {
 
     // ──────────────────────────── Core dispatch ────────────────────────────
 
-    private Response dispatch(String httpMethod, String apiId, String stageName,
+    Response dispatch(String httpMethod, String apiId, String stageName,
                               String proxy, HttpHeaders headers, UriInfo uriInfo, byte[] body) {
         String region = regionResolver.resolveRegion(headers);
 
@@ -157,6 +166,10 @@ public class ApiGatewayExecuteController {
         Response authResponse = invokeAuthorizer(region, apiId, method, headers, uriInfo);
         if (authResponse != null) return authResponse;
 
+        // 2. Request validation
+        Response validationResponse = validateRequest(region, apiId, method, headers, uriInfo, body);
+        if (validationResponse != null) return validationResponse;
+
         Integration integration = method.getMethodIntegration();
         if (integration == null) {
             return Response.status(500)
@@ -170,7 +183,9 @@ public class ApiGatewayExecuteController {
         return switch (integration.getType().toUpperCase()) {
             case "AWS_PROXY" -> invokeProxy(region, httpMethod, path, proxy, stageName,
                     matched, integration, headers, uriInfo, body);
-            case "MOCK" -> invokeMock(integration);
+            case "AWS" -> invokeAwsIntegration(region, httpMethod, path, proxy, stageName,
+                    matched, integration, headers, uriInfo, body);
+            case "MOCK" -> invokeMock(region, httpMethod, path, stageName, matched, integration, headers, uriInfo, body);
             default -> Response.status(500)
                     .entity(jsonMessage("Unsupported integration type: " + integration.getType()))
                     .type(MediaType.APPLICATION_JSON).build();
@@ -242,6 +257,97 @@ public class ApiGatewayExecuteController {
         return null;
     }
 
+    private Response validateRequest(String region, String apiId, MethodConfig method,
+                                      HttpHeaders headers, UriInfo uriInfo, byte[] body) {
+        String validatorId = method.getRequestValidatorId();
+        if (validatorId == null) return null;
+
+        io.github.hectorvent.floci.services.apigateway.model.RequestValidator validator;
+        try {
+            validator = apiGatewayService.getRequestValidator(region, apiId, validatorId);
+        } catch (AwsException e) {
+            return null; // Validator not found — skip validation
+        }
+
+        // Validate request parameters
+        if (validator.isValidateRequestParameters()) {
+            Map<String, Boolean> requiredParams = method.getRequestParameters();
+            if (requiredParams != null) {
+                MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
+                for (Map.Entry<String, Boolean> entry : requiredParams.entrySet()) {
+                    if (!Boolean.TRUE.equals(entry.getValue())) continue;
+                    String paramKey = entry.getKey();
+                    // Format: method.request.querystring.name or method.request.header.name
+                    if (paramKey.startsWith("method.request.querystring.")) {
+                        String name = paramKey.substring("method.request.querystring.".length());
+                        if (!queryParams.containsKey(name) || queryParams.getFirst(name) == null) {
+                            return Response.status(400)
+                                    .entity(jsonMessage("Missing required request parameter in QUERY_STRING: '" + name + "'"))
+                                    .type(MediaType.APPLICATION_JSON).build();
+                        }
+                    } else if (paramKey.startsWith("method.request.header.")) {
+                        String name = paramKey.substring("method.request.header.".length());
+                        if (headers.getHeaderString(name) == null) {
+                            return Response.status(400)
+                                    .entity(jsonMessage("Missing required request parameter in HEADER: '" + name + "'"))
+                                    .type(MediaType.APPLICATION_JSON).build();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Validate request body against model schema
+        if (validator.isValidateRequestBody()) {
+            Map<String, String> requestModels = method.getRequestModels();
+            if (requestModels != null && !requestModels.isEmpty()) {
+                String contentType = headers.getMediaType() != null
+                        ? headers.getMediaType().getType() + "/" + headers.getMediaType().getSubtype()
+                        : "application/json";
+                String modelName = requestModels.get(contentType);
+                if (modelName == null) modelName = requestModels.get("application/json");
+
+                if (modelName != null) {
+                    try {
+                        io.github.hectorvent.floci.services.apigateway.model.Model model =
+                                apiGatewayService.getModel(region, apiId, modelName);
+                        String schemaStr = model.getSchema();
+                        if (schemaStr != null && !schemaStr.isBlank()) {
+                            String bodyStr = body != null ? new String(body, StandardCharsets.UTF_8) : "";
+                            if (bodyStr.isBlank()) {
+                                return Response.status(400)
+                                        .entity(jsonMessage("Invalid request body"))
+                                        .type(MediaType.APPLICATION_JSON).build();
+                            }
+                            JsonNode schemaNode = objectMapper.readTree(schemaStr);
+                            JsonNode bodyNode = objectMapper.readTree(bodyStr);
+
+                            com.networknt.schema.JsonSchemaFactory factory =
+                                    com.networknt.schema.JsonSchemaFactory.getInstance(
+                                            com.networknt.schema.SpecVersion.VersionFlag.V4);
+                            com.networknt.schema.JsonSchema schema = factory.getSchema(schemaNode);
+                            var errors = schema.validate(bodyNode);
+                            if (!errors.isEmpty()) {
+                                String errorMsg = errors.iterator().next().getMessage();
+                                return Response.status(400)
+                                        .entity(jsonMessage("Invalid request body: " + errorMsg))
+                                        .type(MediaType.APPLICATION_JSON).build();
+                            }
+                        }
+                    } catch (AwsException e) {
+                        // Model not found — skip body validation
+                    } catch (Exception e) {
+                        return Response.status(400)
+                                .entity(jsonMessage("Invalid request body"))
+                                .type(MediaType.APPLICATION_JSON).build();
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
     private String toAuthorizerEvent(io.github.hectorvent.floci.services.apigateway.model.Authorizer auth, HttpHeaders headers) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("type", auth.getType());
@@ -309,6 +415,7 @@ public class ApiGatewayExecuteController {
 
         ObjectNode pathParams = event.putObject("pathParameters");
         if (proxy != null && !proxy.isEmpty()) pathParams.put("proxy", proxy);
+        extractPathParams(resourcePath, path).forEach(pathParams::put);
 
         event.putNull("stageVariables");
 
@@ -374,20 +481,360 @@ public class ApiGatewayExecuteController {
         }
     }
 
+    // ──────────────────────────── AWS (non-proxy) ────────────────────────────
+
+    private Response invokeAwsIntegration(String region, String httpMethod, String path, String proxy,
+                                          String stageName, ApiGatewayResource resource,
+                                          Integration integration, HttpHeaders headers,
+                                          UriInfo uriInfo, byte[] body) {
+        AwsServiceRouter.IntegrationTarget target = serviceRouter.parseIntegrationUri(integration.getUri());
+        if (target == null) {
+            return Response.status(500)
+                    .entity(jsonMessage("Cannot parse AWS integration URI: " + integration.getUri()))
+                    .type(MediaType.APPLICATION_JSON).build();
+        }
+
+        String requestId = UUID.randomUUID().toString();
+        String bodyStr = body != null && body.length > 0 ? new String(body) : null;
+
+        // Build VTL context
+        Map<String, String> headerMap = new HashMap<>();
+        for (Map.Entry<String, List<String>> e : headers.getRequestHeaders().entrySet()) {
+            if (!e.getValue().isEmpty()) headerMap.put(e.getKey(), e.getValue().get(0));
+        }
+        Map<String, String> queryMap = new HashMap<>();
+        for (Map.Entry<String, List<String>> e : uriInfo.getQueryParameters().entrySet()) {
+            if (!e.getValue().isEmpty()) queryMap.put(e.getKey(), e.getValue().get(0));
+        }
+        Map<String, String> pathMap = new HashMap<>();
+        if (proxy != null && !proxy.isEmpty()) pathMap.put("proxy", proxy);
+        pathMap.putAll(extractPathParams(resource.getPath(), path));
+
+        VtlTemplateEngine.VtlContext vtlCtx = new VtlTemplateEngine.VtlContext(
+                bodyStr, headerMap, queryMap, pathMap, stageName, httpMethod,
+                resource.getPath(), requestId, "000000000000", null);
+
+        // Apply request parameter mapping (method.request.* → integration.request.*)
+        Map<String, String> integrationReqParams = integration.getRequestParameters();
+        if (integrationReqParams != null && !integrationReqParams.isEmpty()) {
+            for (Map.Entry<String, String> param : integrationReqParams.entrySet()) {
+                String dest = param.getKey();    // integration.request.header.X-Foo or integration.request.querystring.bar
+                String source = param.getValue(); // method.request.querystring.q or method.request.header.Auth or method.request.path.id
+                String resolvedValue = resolveRequestParameter(source, queryMap, pathMap, headerMap);
+                if (resolvedValue != null) {
+                    if (dest.startsWith("integration.request.header.")) {
+                        headerMap.put(dest.substring("integration.request.header.".length()), resolvedValue);
+                    } else if (dest.startsWith("integration.request.querystring.")) {
+                        queryMap.put(dest.substring("integration.request.querystring.".length()), resolvedValue);
+                    } else if (dest.startsWith("integration.request.path.")) {
+                        pathMap.put(dest.substring("integration.request.path.".length()), resolvedValue);
+                    }
+                }
+            }
+        }
+
+        // Content-Type negotiation and passthrough behavior
+        String transformedBody;
+        Map<String, String> requestTemplates = integration.getRequestTemplates();
+        String incomingContentType = headerMap.getOrDefault("Content-Type",
+                headerMap.getOrDefault("content-type", "application/json"));
+
+        if (requestTemplates != null && !requestTemplates.isEmpty()) {
+            // Try exact match first, then wildcard fallback
+            String template = requestTemplates.get(incomingContentType);
+            if (template == null) {
+                // Try without charset: "application/json; charset=utf-8" → "application/json"
+                String baseType = incomingContentType.contains(";")
+                        ? incomingContentType.substring(0, incomingContentType.indexOf(';')).trim()
+                        : incomingContentType;
+                template = requestTemplates.get(baseType);
+            }
+
+            if (template != null) {
+                transformedBody = vtlEngine.evaluate(template, vtlCtx).body();
+            } else {
+                // No matching template for this Content-Type
+                String behavior = integration.getPassthroughBehavior();
+                if ("NEVER".equalsIgnoreCase(behavior)) {
+                    return Response.status(415)
+                            .entity(jsonMessage("Unsupported Media Type"))
+                            .type(MediaType.APPLICATION_JSON).build();
+                } else if ("WHEN_NO_TEMPLATES".equalsIgnoreCase(behavior)) {
+                    // Templates exist but none match → reject
+                    return Response.status(415)
+                            .entity(jsonMessage("Unsupported Media Type"))
+                            .type(MediaType.APPLICATION_JSON).build();
+                } else {
+                    // WHEN_NO_MATCH (default) — passthrough
+                    transformedBody = bodyStr != null ? bodyStr : "";
+                }
+            }
+        } else {
+            // No templates defined at all
+            String behavior = integration.getPassthroughBehavior();
+            if ("NEVER".equalsIgnoreCase(behavior)) {
+                return Response.status(415)
+                        .entity(jsonMessage("Unsupported Media Type"))
+                        .type(MediaType.APPLICATION_JSON).build();
+            }
+            transformedBody = bodyStr != null ? bodyStr : "";
+        }
+
+        // Dispatch to service
+        Response serviceResponse;
+        String errorType = null;
+        String errorMessage = null;
+        try {
+            JsonNode requestJson = objectMapper.readTree(transformedBody);
+            serviceResponse = serviceRouter.invoke(target.service(), target.action(), requestJson, region);
+        } catch (AwsException e) {
+            errorType = e.getErrorCode();
+            errorMessage = e.getMessage();
+            serviceResponse = null;
+        } catch (Exception e) {
+            errorType = "InternalError";
+            errorMessage = e.getMessage() != null ? e.getMessage() : "Service invocation failed";
+            serviceResponse = null;
+        }
+
+        // Build response body string
+        String responseBodyStr;
+        int serviceStatus;
+        if (serviceResponse != null) {
+            serviceStatus = serviceResponse.getStatus();
+            Object entity = serviceResponse.getEntity();
+            if (entity instanceof JsonNode jsonNode) {
+                try {
+                    responseBodyStr = objectMapper.writeValueAsString(jsonNode);
+                } catch (Exception e) {
+                    responseBodyStr = entity.toString();
+                }
+            } else if (entity != null) {
+                responseBodyStr = entity.toString();
+            } else {
+                responseBodyStr = "{}";
+            }
+
+            // Check if service returned an error status
+            if (serviceStatus >= 400) {
+                try {
+                    JsonNode errorNode = objectMapper.readTree(responseBodyStr);
+                    errorType = errorNode.path("__type").asText(
+                            errorNode.path("errorType").asText(null));
+                    errorMessage = errorNode.path("message").asText(
+                            errorNode.path("Message").asText(
+                                    errorNode.path("errorMessage").asText("Service error")));
+                } catch (Exception ignored) {
+                    errorType = "ServiceError";
+                    errorMessage = responseBodyStr;
+                }
+            }
+        } else {
+            serviceStatus = 500;
+            responseBodyStr = String.format("{\"errorMessage\":\"%s\",\"errorType\":\"%s\"}",
+                    errorMessage != null ? errorMessage.replace("\"", "\\\"") : "Unknown error",
+                    errorType != null ? errorType : "UnknownError");
+        }
+
+        // Select integration response
+        Map<String, IntegrationResponse> integrationResponses = integration.getIntegrationResponses();
+        IntegrationResponse matchedResponse = null;
+        IntegrationResponse defaultResponse = null;
+
+        // Build the error string to match selectionPattern against.
+        // AWS matches against the error response body/message. We match against
+        // both errorType and errorMessage to catch patterns like ".*ResourceNotFoundException.*".
+        String errorMatchString = errorType != null
+                ? errorType + (errorMessage != null ? ": " + errorMessage : "")
+                : errorMessage;
+
+        if (integrationResponses != null && !integrationResponses.isEmpty()) {
+            for (IntegrationResponse ir : integrationResponses.values()) {
+                if (ir.selectionPattern() == null || ir.selectionPattern().isEmpty()) {
+                    defaultResponse = ir;
+                } else if (errorMatchString != null) {
+                    try {
+                        if (Pattern.matches(ir.selectionPattern(), errorMatchString)) {
+                            matchedResponse = ir;
+                            break;
+                        }
+                    } catch (Exception ignored) {
+                        // Invalid regex — skip
+                    }
+                }
+            }
+            if (matchedResponse == null) {
+                matchedResponse = defaultResponse;
+            }
+        }
+
+        // Determine final status code and body
+        int finalStatus;
+        String finalBody;
+        VtlTemplateEngine.EvaluateResult templateResult = null;
+
+        if (matchedResponse != null) {
+            finalStatus = Integer.parseInt(matchedResponse.statusCode());
+
+            Map<String, String> responseTemplates = matchedResponse.responseTemplates();
+            if (responseTemplates != null && !responseTemplates.isEmpty()) {
+                String responseTemplate = responseTemplates.getOrDefault("application/json",
+                        responseTemplates.values().iterator().next());
+                if (responseTemplate != null && !responseTemplate.isEmpty()) {
+                    VtlTemplateEngine.VtlContext responseMappingCtx = new VtlTemplateEngine.VtlContext(
+                            responseBodyStr, headerMap, queryMap, pathMap, stageName, httpMethod,
+                            resource.getPath(), requestId, "000000000000", null);
+                    templateResult = vtlEngine.evaluate(responseTemplate, responseMappingCtx);
+                    finalBody = templateResult.body();
+                } else {
+                    finalBody = responseBodyStr;
+                }
+            } else {
+                finalBody = responseBodyStr;
+            }
+        } else {
+            finalStatus = errorType != null ? 500 : (serviceStatus >= 400 ? serviceStatus : 200);
+            finalBody = responseBodyStr;
+        }
+
+        // Apply $context.responseOverride assignments from the response template (if any).
+        if (templateResult != null) {
+            if (templateResult.statusOverride() != null) {
+                finalStatus = templateResult.statusOverride();
+            }
+        }
+
+        Response.ResponseBuilder rb = Response.status(finalStatus)
+                .entity(finalBody)
+                .type(MediaType.APPLICATION_JSON);
+
+        // Apply $context.responseOverride header assignments.
+        if (templateResult != null && !templateResult.headerOverrides().isEmpty()) {
+            for (Map.Entry<String, String> hdr : templateResult.headerOverrides().entrySet()) {
+                rb.header(hdr.getKey(), hdr.getValue());
+            }
+        }
+
+        // Apply response parameter mapping (header mapping from responseParameters config).
+        if (matchedResponse != null && matchedResponse.responseParameters() != null) {
+            Map<String, String> serviceResponseHeaders = new HashMap<>();
+            if (serviceResponse != null) {
+                for (Map.Entry<String, List<String>> e : serviceResponse.getStringHeaders().entrySet()) {
+                    if (!e.getValue().isEmpty()) serviceResponseHeaders.put(e.getKey(), e.getValue().get(0));
+                }
+            }
+            for (Map.Entry<String, String> param : matchedResponse.responseParameters().entrySet()) {
+                String dest = param.getKey();   // method.response.header.X-Foo
+                String source = param.getValue(); // integration.response.header.X-Bar or 'static' or integration.response.body.jsonpath
+                if (!dest.startsWith("method.response.header.")) continue;
+                String headerName = dest.substring("method.response.header.".length());
+                String headerValue = resolveResponseParameter(source, serviceResponseHeaders, responseBodyStr);
+                if (headerValue != null) {
+                    rb.header(headerName, headerValue);
+                }
+            }
+        }
+
+        return rb.build();
+    }
+
+    private String resolveResponseParameter(String source, Map<String, String> serviceHeaders, String responseBody) {
+        if (source == null) return null;
+        // Static value: 'some value'
+        if (source.startsWith("'") && source.endsWith("'")) {
+            return source.substring(1, source.length() - 1);
+        }
+        // Integration response header
+        if (source.startsWith("integration.response.header.")) {
+            String headerName = source.substring("integration.response.header.".length());
+            return serviceHeaders.get(headerName);
+        }
+        // Integration response body (JSONPath)
+        if (source.startsWith("integration.response.body.")) {
+            String jsonPath = "$." + source.substring("integration.response.body.".length());
+            try {
+                JsonNode root = objectMapper.readTree(responseBody);
+                JsonNode node = VtlTemplateEngine.InputVariable.resolvePath(root, jsonPath);
+                return node.isMissingNode() ? null : node.asText();
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private String resolveRequestParameter(String source, Map<String, String> queryParams,
+                                            Map<String, String> pathParams, Map<String, String> headers) {
+        if (source == null) return null;
+        if (source.startsWith("method.request.querystring.")) {
+            return queryParams.get(source.substring("method.request.querystring.".length()));
+        }
+        if (source.startsWith("method.request.path.")) {
+            return pathParams.get(source.substring("method.request.path.".length()));
+        }
+        if (source.startsWith("method.request.header.")) {
+            return headers.get(source.substring("method.request.header.".length()));
+        }
+        // Static value
+        if (source.startsWith("'") && source.endsWith("'")) {
+            return source.substring(1, source.length() - 1);
+        }
+        return null;
+    }
+
     // ──────────────────────────── MOCK ────────────────────────────
 
-    private Response invokeMock(Integration integration) {
+    private Response invokeMock(String region, String httpMethod, String path, String stageName,
+                                ApiGatewayResource resource, Integration integration,
+                                HttpHeaders headers, UriInfo uriInfo, byte[] body) {
         // Use the "200" integration response if present, else return empty 200
         IntegrationResponse ir = integration.getIntegrationResponses().get("200");
         if (ir == null) {
             return Response.ok().build();
         }
+
         String template = ir.responseTemplates() != null
                 ? ir.responseTemplates().getOrDefault("application/json", "") : "";
-        return Response.status(Integer.parseInt(ir.statusCode()))
-                .entity(template)
-                .type(MediaType.APPLICATION_JSON)
-                .build();
+
+        if (template.isEmpty()) {
+            return Response.status(Integer.parseInt(ir.statusCode()))
+                    .type(MediaType.APPLICATION_JSON)
+                    .build();
+        }
+
+        // Evaluate the response template through VTL (supports $context.responseOverride etc.)
+        String requestId = UUID.randomUUID().toString();
+        String bodyStr = body != null && body.length > 0 ? new String(body) : null;
+
+        Map<String, String> headerMap = new HashMap<>();
+        for (Map.Entry<String, List<String>> e : headers.getRequestHeaders().entrySet()) {
+            if (!e.getValue().isEmpty()) headerMap.put(e.getKey(), e.getValue().get(0));
+        }
+        Map<String, String> queryMap = new HashMap<>();
+        for (Map.Entry<String, List<String>> e : uriInfo.getQueryParameters().entrySet()) {
+            if (!e.getValue().isEmpty()) queryMap.put(e.getKey(), e.getValue().get(0));
+        }
+        Map<String, String> pathMap = new HashMap<>(extractPathParams(resource.getPath(), path));
+
+        VtlTemplateEngine.VtlContext vtlCtx = new VtlTemplateEngine.VtlContext(
+                bodyStr, headerMap, queryMap, pathMap, stageName, httpMethod,
+                resource.getPath(), requestId, "000000000000", null);
+
+        VtlTemplateEngine.EvaluateResult result = vtlEngine.evaluate(template, vtlCtx);
+
+        int status = result.statusOverride() != null
+                ? result.statusOverride()
+                : Integer.parseInt(ir.statusCode());
+
+        Response.ResponseBuilder rb = Response.status(status)
+                .entity(result.body())
+                .type(MediaType.APPLICATION_JSON);
+
+        for (Map.Entry<String, String> hdr : result.headerOverrides().entrySet()) {
+            rb.header(hdr.getKey(), hdr.getValue());
+        }
+
+        return rb.build();
     }
 
     // ──────────────────────────── API Gateway v2 dispatch ────────────────────────────
@@ -625,7 +1072,7 @@ public class ApiGatewayExecuteController {
 
     /**
      * Finds the best-matching resource for {@code requestPath}.
-     * Priority: exact match > wildcard/proxy+ match.
+     * Priority: exact match > template path match (e.g. /items/{id}) > proxy+ wildcard.
      */
     private ApiGatewayResource matchResource(List<ApiGatewayResource> resources, String requestPath) {
         // 1. Exact match
@@ -634,12 +1081,57 @@ public class ApiGatewayExecuteController {
                 return r;
             }
         }
-        // 2. Wildcard / {proxy+} — any resource whose pathPart contains "{"
+        // 2. Template path match — /items/{id} matches /items/anything
+        for (ApiGatewayResource r : resources) {
+            if (r.getPath() != null && r.getPath().contains("{") && !r.getPath().contains("{proxy+}")) {
+                if (pathMatchesTemplate(r.getPath(), requestPath)) {
+                    return r;
+                }
+            }
+        }
+        // 3. Proxy+ wildcard — {proxy+} matches any remaining path
         for (ApiGatewayResource r : resources) {
             if (r.getPathPart() != null && r.getPathPart().contains("{")) {
                 return r;
             }
         }
         return null;
+    }
+
+    /**
+     * Returns true if {@code requestPath} matches the template path (e.g. {@code /items/{id}}).
+     * Segments wrapped in {@code {}} match any single path segment.
+     */
+    private boolean pathMatchesTemplate(String templatePath, String requestPath) {
+        String[] tParts = templatePath.split("/", -1);
+        String[] rParts = requestPath.split("/", -1);
+        if (tParts.length != rParts.length) return false;
+        for (int i = 0; i < tParts.length; i++) {
+            if (tParts[i].startsWith("{") && tParts[i].endsWith("}")) continue; // wildcard segment
+            if (!tParts[i].equals(rParts[i])) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Extracts named path parameters from a matched template path.
+     * Given template {@code /items/{id}} and request {@code /items/item-1}, returns {@code {id=item-1}}.
+     */
+    private Map<String, String> extractPathParams(String templatePath, String requestPath) {
+        Map<String, String> params = new HashMap<>();
+        if (templatePath == null || requestPath == null) return params;
+        String[] tParts = templatePath.split("/", -1);
+        String[] rParts = requestPath.split("/", -1);
+        if (tParts.length != rParts.length) return params;
+        for (int i = 0; i < tParts.length; i++) {
+            String t = tParts[i];
+            if (t.startsWith("{") && t.endsWith("}")) {
+                String name = t.substring(1, t.length() - 1);
+                if (!name.endsWith("+")) { // skip {proxy+}
+                    params.put(name, rParts[i]);
+                }
+            }
+        }
+        return params;
     }
 }

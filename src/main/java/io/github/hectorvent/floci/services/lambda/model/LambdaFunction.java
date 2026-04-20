@@ -4,7 +4,9 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 @RegisterForReflection
@@ -26,11 +28,16 @@ public class LambdaFunction {
     private String packageType = "Zip";
     private String imageUri;
     private String codeLocalPath;
+    private String s3Bucket;
+    private String s3Key;
     private Map<String, String> environment = new HashMap<>();
     private Map<String, String> tags = new HashMap<>();
+    private List<Map<String, Object>> policies = new ArrayList<>();
     private long lastModified;
     private String revisionId;
+    private String version = "$LATEST";
     private LambdaUrlConfig urlConfig;
+    private Integer reservedConcurrentExecutions;
 
     @JsonIgnore
     private volatile ContainerState containerState = ContainerState.COLD;
@@ -83,11 +90,20 @@ public class LambdaFunction {
     public String getCodeLocalPath() { return codeLocalPath; }
     public void setCodeLocalPath(String codeLocalPath) { this.codeLocalPath = codeLocalPath; }
 
+    public String getS3Bucket() { return s3Bucket; }
+    public void setS3Bucket(String s3Bucket) { this.s3Bucket = s3Bucket; }
+
+    public String getS3Key() { return s3Key; }
+    public void setS3Key(String s3Key) { this.s3Key = s3Key; }
+
     public Map<String, String> getEnvironment() { return environment; }
     public void setEnvironment(Map<String, String> environment) { this.environment = environment; }
 
     public Map<String, String> getTags() { return tags; }
     public void setTags(Map<String, String> tags) { this.tags = tags; }
+
+    public List<Map<String, Object>> getPolicies() { return policies; }
+    public void setPolicies(List<Map<String, Object>> policies) { this.policies = policies; }
 
     public long getLastModified() { return lastModified; }
     public void setLastModified(long lastModified) { this.lastModified = lastModified; }
@@ -95,8 +111,14 @@ public class LambdaFunction {
     public String getRevisionId() { return revisionId; }
     public void setRevisionId(String revisionId) { this.revisionId = revisionId; }
 
+    public String getVersion() { return version; }
+    public void setVersion(String version) { this.version = version; }
+
     public LambdaUrlConfig getUrlConfig() { return urlConfig; }
     public void setUrlConfig(LambdaUrlConfig urlConfig) { this.urlConfig = urlConfig; }
+
+    public Integer getReservedConcurrentExecutions() { return reservedConcurrentExecutions; }
+    public void setReservedConcurrentExecutions(Integer reservedConcurrentExecutions) { this.reservedConcurrentExecutions = reservedConcurrentExecutions; }
 
     @JsonIgnore
     public ContainerState getContainerState() { return containerState; }

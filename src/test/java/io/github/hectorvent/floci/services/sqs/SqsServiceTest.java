@@ -288,4 +288,61 @@ class SqsServiceTest {
         assertThrows(AwsException.class, () ->
                 sqsService.sendMessage(queue.getQueueUrl(), "msg", 0, "group1", null));
     }
+
+    @Test
+    void receiveMessageUsesQueueVisibilityTimeoutWhenNotSpecified() {
+        // Create queue with a short visibility timeout (1 second)
+        Queue queue = sqsService.createQueue("short-vt-queue",
+                Map.of("VisibilityTimeout", "1"));
+        sqsService.sendMessage(queue.getQueueUrl(), "test-msg", 0);
+
+        // Receive without specifying visibility timeout (-1 means "use queue default")
+        List<Message> first = sqsService.receiveMessage(queue.getQueueUrl(), 1, -1, 0);
+        assertEquals(1, first.size());
+
+        // Message should be invisible immediately after receive
+        List<Message> second = sqsService.receiveMessage(queue.getQueueUrl(), 1, -1, 0);
+        assertTrue(second.isEmpty());
+
+        // Wait for the queue's visibility timeout (1s) to expire, not the global default (30s)
+        try { Thread.sleep(1100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+        // Message should now be visible again
+        List<Message> third = sqsService.receiveMessage(queue.getQueueUrl(), 1, -1, 0);
+        assertEquals(1, third.size(), "Message should become visible after queue's VisibilityTimeout (1s), not global default (30s)");
+    }
+
+    // --- Queue-level DelaySeconds for FIFO queues (issue #475) ---
+
+    @Test
+    void queueLevelDelaySecondsAppliesToFifoQueue() {
+        Queue queue = sqsService.createQueue("delay-fifo.fifo",
+                Map.of("ContentBasedDeduplication", "true", "DelaySeconds", "1"));
+        sqsService.sendMessage(queue.getQueueUrl(), "msg", 0, "group1", null);
+
+        List<Message> immediate = sqsService.receiveMessage(queue.getQueueUrl(), 1, 0, 0);
+        assertTrue(immediate.isEmpty(),
+                "FIFO queue should honor queue-level DelaySeconds (issue #475)");
+
+        try { Thread.sleep(1100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+        List<Message> later = sqsService.receiveMessage(queue.getQueueUrl(), 1, 0, 0);
+        assertEquals(1, later.size(),
+                "Message should become visible once DelaySeconds elapses");
+    }
+
+    @Test
+    void fifoQueueIgnoresPerMessageDelaySeconds() {
+        // AWS SQS FIFO queues only support queue-level DelaySeconds; any
+        // per-message value is ignored. Here the queue default is 0 and the
+        // caller passes a positive per-message delay -- the message must be
+        // immediately visible.
+        Queue queue = sqsService.createQueue("fifo-ignores-per-msg.fifo",
+                Map.of("ContentBasedDeduplication", "true"));
+        sqsService.sendMessage(queue.getQueueUrl(), "msg", 60, "group1", null);
+
+        List<Message> immediate = sqsService.receiveMessage(queue.getQueueUrl(), 1, 0, 0);
+        assertEquals(1, immediate.size(),
+                "FIFO queues must ignore per-message DelaySeconds");
+    }
 }

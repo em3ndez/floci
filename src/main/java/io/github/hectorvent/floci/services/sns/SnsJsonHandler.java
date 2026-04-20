@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.sns;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.services.sns.model.Subscription;
 import io.github.hectorvent.floci.services.sns.model.Topic;
+import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -114,7 +115,8 @@ public class SnsJsonHandler {
         String topicArn = request.path("TopicArn").asText(null);
         String protocol = request.path("Protocol").asText(null);
         String endpoint = request.path("Endpoint").asText(null);
-        Subscription sub = snsService.subscribe(topicArn, protocol, endpoint, region);
+        Map<String, String> attributes = jsonNodeToMap(request.path("Attributes"));
+        Subscription sub = snsService.subscribe(topicArn, protocol, endpoint, region, attributes);
         ObjectNode response = objectMapper.createObjectNode();
         response.put("SubscriptionArn", sub.getSubscriptionArn());
         return Response.ok(response).build();
@@ -150,18 +152,21 @@ public class SnsJsonHandler {
     private Response handlePublish(JsonNode request, String region) {
         String topicArn = request.path("TopicArn").asText(null);
         String targetArn = request.path("TargetArn").asText(null);
+        String phoneNumber = request.path("PhoneNumber").asText(null);
         String message = request.path("Message").asText(null);
         String subject = request.path("Subject").asText(null);
 
-        Map<String, String> attributes = new HashMap<>();
+        Map<String, MessageAttributeValue> attributes = new HashMap<>();
         JsonNode attrsNode = request.path("MessageAttributes");
         if (attrsNode.isObject()) {
             attrsNode.fields().forEachRemaining(entry -> {
-                attributes.put(entry.getKey(), entry.getValue().path("StringValue").asText());
+                String dataType = entry.getValue().path("DataType").asText("String");
+                String stringValue = entry.getValue().path("StringValue").asText();
+                attributes.put(entry.getKey(), new MessageAttributeValue(stringValue, dataType));
             });
         }
 
-        String messageId = snsService.publish(topicArn, targetArn, message, subject, attributes, region);
+        String messageId = snsService.publish(topicArn, targetArn, phoneNumber, message, subject, attributes, region);
         ObjectNode response = objectMapper.createObjectNode();
         response.put("MessageId", messageId);
         return Response.ok(response).build();

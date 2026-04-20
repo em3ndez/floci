@@ -7,6 +7,9 @@ import java.util.Optional;
 @ConfigMapping(prefix = "floci")
 public interface EmulatorConfig {
 
+    @WithDefault("4566")
+    int port();
+
     @WithDefault("http://localhost:4566")
     String baseUrl();
 
@@ -35,8 +38,17 @@ public interface EmulatorConfig {
     @WithDefault("us-east-1")
     String defaultRegion();
 
+    @WithDefault("us-east-1a")
+    String defaultAvailabilityZone();
+
     @WithDefault("000000000000")
     String defaultAccountId();
+
+    @WithDefault("512")
+    int maxRequestSize();
+
+    @WithDefault("public.ecr.aws")
+    String ecrBaseUri();
 
     StorageConfig storage();
 
@@ -44,12 +56,20 @@ public interface EmulatorConfig {
 
     ServicesConfig services();
 
+    DockerConfig docker();
+
+    InitHooksConfig initHooks();
+
     interface StorageConfig {
         @WithDefault("hybrid")
         String mode();
 
         @WithDefault("./data")
         String persistentPath();
+
+        /** The path on the host machine where data is stored. Useful for Docker-in-Docker. */
+        @WithDefault("${floci.storage.persistent-path}")
+        String hostPersistentPath();
 
         WalConfig wal();
 
@@ -67,77 +87,99 @@ public interface EmulatorConfig {
         CloudWatchMetricsStorageConfig cloudwatchmetrics();
         SecretsManagerStorageConfig secretsmanager();
         AcmStorageConfig acm();
+        OpenSearchStorageConfig opensearch();
+        AppConfigStorageConfig appconfig();
+        AppConfigDataStorageConfig appconfigdata();
+        ElastiCacheStorageConfig elasticache();
     }
 
     interface SsmStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface SqsStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
     }
 
     interface S3StorageConfig {
-        @WithDefault("hybrid")
-        String mode();
+        Optional<String> mode();
     }
 
     interface DynamoDbStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface SnsStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface LambdaStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface CloudWatchLogsStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface CloudWatchMetricsStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface SecretsManagerStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
     }
 
     interface AcmStorageConfig {
-        @WithDefault("memory")
-        String mode();
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
+    interface OpenSearchStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
+    interface AppConfigStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
+    interface AppConfigDataStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
+    interface ElastiCacheStorageConfig {
+        Optional<String> mode();
 
         @WithDefault("5000")
         long flushIntervalMs();
@@ -169,20 +211,34 @@ public interface EmulatorConfig {
         LambdaServiceConfig lambda();
         ApiGatewayServiceConfig apigateway();
         IamServiceConfig iam();
+        MskServiceConfig msk();
         ElastiCacheServiceConfig elasticache();
         RdsServiceConfig rds();
         EventBridgeServiceConfig eventbridge();
+        SchedulerServiceConfig scheduler();
         CloudWatchLogsServiceConfig cloudwatchlogs();
         CloudWatchMetricsServiceConfig cloudwatchmetrics();
         SecretsManagerServiceConfig secretsmanager();
         ApiGatewayV2ServiceConfig apigatewayv2();
         KinesisServiceConfig kinesis();
+        FirehoseServiceConfig firehose();
         KmsServiceConfig kms();
         CognitoServiceConfig cognito();
         StepFunctionsServiceConfig stepfunctions();
         CloudFormationServiceConfig cloudformation();
         AcmServiceConfig acm();
+        AthenaServiceConfig athena();
+        GlueServiceConfig glue();
         SesServiceConfig ses();
+        OpenSearchServiceConfig opensearch();
+        Ec2ServiceConfig ec2();
+        EcsServiceConfig ecs();
+        AppConfigServiceConfig appconfig();
+        AppConfigDataServiceConfig appconfigdata();
+        EcrServiceConfig ecr();
+        ResourceGroupsTaggingServiceConfig tagging();
+        BedrockRuntimeServiceConfig bedrockRuntime();
+        EksServiceConfig eks();
     }
 
     interface SsmServiceConfig {
@@ -230,6 +286,20 @@ public interface EmulatorConfig {
     interface IamServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        @WithDefault("false")
+        boolean enforcementEnabled();
+    }
+
+    interface MskServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        @WithDefault("false")
+        boolean mock();
+
+        @WithDefault("redpandadata/redpanda:latest")
+        String defaultImage();
     }
 
     interface ElastiCacheServiceConfig {
@@ -277,6 +347,11 @@ public interface EmulatorConfig {
         boolean enabled();
     }
 
+    interface SchedulerServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
     interface CloudWatchLogsServiceConfig {
         @WithDefault("true")
         boolean enabled();
@@ -304,6 +379,11 @@ public interface EmulatorConfig {
     }
 
     interface KinesisServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface FirehoseServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
@@ -337,9 +417,102 @@ public interface EmulatorConfig {
         int validationWaitSeconds();
     }
 
+    interface AthenaServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface GlueServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
     interface SesServiceConfig {
         @WithDefault("true")
         boolean enabled();
+    }
+
+    interface OpenSearchServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /** When true, domains are simulated in-memory without real Docker containers. */
+        @WithDefault("false")
+        boolean mock();
+
+        @WithDefault("opensearchproject/opensearch:2")
+        String defaultImage();
+
+        @WithDefault("9400")
+        int proxyBasePort();
+
+        @WithDefault("9499")
+        int proxyMaxPort();
+
+        @WithDefault("${floci.storage.persistent-path}/opensearch")
+        String dataPath();
+
+        @WithDefault("false")
+        boolean keepRunningOnShutdown();
+    }
+
+    interface EcsServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /** When true, tasks go straight to RUNNING without starting real Docker containers. */
+        @WithDefault("false")
+        boolean mock();
+
+        Optional<String> dockerNetwork();
+
+        @WithDefault("512")
+        int defaultMemoryMb();
+
+        @WithDefault("256")
+        int defaultCpuUnits();
+    }
+
+    interface ResourceGroupsTaggingServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface BedrockRuntimeServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface EcrServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        @WithDefault("registry:2")
+        String registryImage();
+
+        @WithDefault("floci-ecr-registry")
+        String registryContainerName();
+
+        @WithDefault("5100")
+        int registryBasePort();
+
+        @WithDefault("5199")
+        int registryMaxPort();
+
+        @WithDefault("${floci.storage.persistent-path}/ecr")
+        String dataPath();
+
+        @WithDefault("false")
+        boolean tlsEnabled();
+
+        @WithDefault("true")
+        boolean keepRunningOnShutdown();
+
+        /** URI style for repositoryUri responses: "hostname" (default, *.dkr.ecr.<region>.localhost) or "path". */
+        @WithDefault("hostname")
+        String uriStyle();
+
+        Optional<String> dockerNetwork();
     }
 
     interface LambdaServiceConfig {
@@ -377,5 +550,97 @@ public interface EmulatorConfig {
 
         /** Docker network to attach Lambda containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();
+
+        /**
+         * Concurrent executions ceiling applied per region. AWS Lambda's
+         * "account-level" concurrency is in fact a per-region quota (default 1000);
+         * Floci mirrors that semantics and partitions counters by the region
+         * segment of each function ARN.
+         */
+        @WithDefault("1000")
+        int regionConcurrencyLimit();
+
+        /**
+         * Minimum unreserved concurrency that must remain after PutFunctionConcurrency,
+         * matching AWS (100). Puts that would leave less than this are rejected.
+         */
+        @WithDefault("100")
+        int unreservedConcurrencyMin();
+    }
+
+    interface Ec2ServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface AppConfigServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface AppConfigDataServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface EksServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /** When true, clusters go straight to ACTIVE without starting real Docker containers. */
+        @WithDefault("false")
+        boolean mock();
+
+        @WithDefault("k3s")
+        String provider();
+
+        @WithDefault("rancher/k3s:latest")
+        String defaultImage();
+
+        @WithDefault("6500")
+        int apiServerBasePort();
+
+        @WithDefault("6599")
+        int apiServerMaxPort();
+
+        @WithDefault("./data/eks")
+        String dataPath();
+
+        /** Docker network to attach k3s containers to. Empty = default bridge. */
+        Optional<String> dockerNetwork();
+
+        @WithDefault("false")
+        boolean keepRunningOnShutdown();
+    }
+
+    interface InitHooksConfig {
+        @WithDefault("/bin/sh")
+        String shellExecutable();
+
+        @WithDefault("2")
+        long shutdownGracePeriodSeconds();
+
+        @WithDefault("30")
+        long timeoutSeconds();
+    }
+
+    /**
+     * Configuration for Docker container management shared across all services
+     * that spawn Docker containers (Lambda, RDS, ElastiCache, ECS, ECR, MSK).
+     */
+    interface DockerConfig {
+        /**
+         * Maximum size of each container log file before rotation.
+         * Uses Docker's json-file log driver max-size option format (e.g., "10m", "100k", "1g").
+         */
+        @WithDefault("10m")
+        String logMaxSize();
+
+        /**
+         * Maximum number of rotated log files to retain per container.
+         * When this limit is reached, the oldest log file is deleted.
+         */
+        @WithDefault("3")
+        String logMaxFile();
     }
 }

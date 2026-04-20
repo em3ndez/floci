@@ -21,6 +21,10 @@ public class S3Object {
     private byte[] data;
     private Map<String, String> metadata;
     private String contentType;
+    private String contentEncoding;
+    private String contentDisposition;
+    private String cacheControl;
+    private String serverSideEncryption;
     private long size;
     private Instant lastModified;
     private String eTag;
@@ -76,6 +80,18 @@ public class S3Object {
 
     public String getContentType() { return contentType; }
     public void setContentType(String contentType) { this.contentType = contentType; }
+
+    public String getContentEncoding() { return contentEncoding; }
+    public void setContentEncoding(String contentEncoding) { this.contentEncoding = contentEncoding; }
+
+    public String getContentDisposition() { return contentDisposition; }
+    public void setContentDisposition(String contentDisposition) { this.contentDisposition = contentDisposition; }
+
+    public String getCacheControl() { return cacheControl; }
+    public void setCacheControl(String cacheControl) { this.cacheControl = cacheControl; }
+
+    public String getServerSideEncryption() { return serverSideEncryption; }
+    public void setServerSideEncryption(String serverSideEncryption) { this.serverSideEncryption = serverSideEncryption; }
 
     public long getSize() { return size; }
     public void setSize(long size) { this.size = size; }

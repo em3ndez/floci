@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.eventbridge;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
@@ -8,6 +9,7 @@ import io.github.hectorvent.floci.services.eventbridge.model.EventBus;
 import io.github.hectorvent.floci.services.eventbridge.model.Rule;
 import io.github.hectorvent.floci.services.eventbridge.model.RuleState;
 import io.github.hectorvent.floci.services.eventbridge.model.Target;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -15,22 +17,29 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 
 class EventBridgeServiceTest {
 
     private static final String REGION = "us-east-1";
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private EventBridgeService service;
+    private EventBridgeInvoker invokerMock;
 
     @BeforeEach
     void setUp() {
+        invokerMock = mock(EventBridgeInvoker.class);
         service = new EventBridgeService(
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new RegionResolver("us-east-1", "000000000000"),
-                null, null, null,
-                new ObjectMapper()
+                new ObjectMapper(),
+                null,
+                invokerMock
         );
     }
 
@@ -292,6 +301,21 @@ class EventBridgeServiceTest {
     }
 
     @Test
+    void matchesPatternByResources() {
+     Map<String, Object> event = Map.of(
+        "Source", "my.app",
+        "Detail", "Payload",
+        "Resources", OBJECT_MAPPER.createArrayNode().add("resource1").add("resource2")
+     );
+
+     assertTrue(service.matchesPattern(event, "{\"resources\":[\"resource1\"]}"));
+     assertTrue(service.matchesPattern(event, "{\"resources\":[\"resource2\"]}"));
+     assertTrue(service.matchesPattern(event, "{\"resources\":[\"resource1\",\"resource2\"]}"));
+     assertFalse(service.matchesPattern(event, "{\"resources\":[\"resource3\"]}"));
+     assertFalse(service.matchesPattern(event, "{\"resources\":[\"*\"]}"));
+    }
+
+    @Test
     void putEventsReturnsEventIds() {
         List<Map<String, Object>> entries = List.of(
                 Map.of("Source", "my.app", "DetailType", "Test", "Detail", "{}")
@@ -314,4 +338,146 @@ class EventBridgeServiceTest {
         EventBridgeService.PutEventsResult result = service.putEvents(entries, REGION);
         assertEquals(1, result.failedCount());
     }
-}
+
+    @Test
+    void putEventsShouldInvokeLambdaTarget() {
+        service.putRule("my-rule", null, "{\"source\":[\"my.app\"]}", null, RuleState.ENABLED,
+                "A test rule", null, null, REGION);
+        Target target = new Target();
+        target.setId("t1");
+        target.setArn("arn:aws:lambda:us-east-1:000000000000:function:my-function");
+        service.putTargets("my-rule", null, List.of(target), "us-east-1");
+
+        ArrayNode resources = OBJECT_MAPPER.createArrayNode().add("resource1");
+        List<Map<String, Object>> entries = List.of(
+                Map.of("Source", "my.app", "DetailType", "Test", "Detail", "{}", "Resources", resources)
+        );
+
+        EventBridgeService.PutEventsResult result = service.putEvents(entries, REGION);
+        assertEquals(0, result.failedCount());
+        assertEquals(1, result.entries().size());
+        assertNotNull(result.entries().getFirst().get("EventId"));
+        verify(invokerMock).invokeTarget(eq(target), any(String.class), eq(REGION));
+    }
+
+    @Test
+    void putEventsShouldInvokeSqsTarget() {
+        service.putRule("my-rule", null, "{\"source\":[\"my.app\"]}", null, RuleState.ENABLED,
+                "A test rule", null, null, REGION);
+        Target target = new Target();
+        target.setId("t1");
+        target.setArn("arn:aws:sqs:us-east-1:000000000000:my-queue");
+        service.putTargets("my-rule", null, List.of(target), "us-east-1");
+
+        ArrayNode resources = OBJECT_MAPPER.createArrayNode().add("resource1");
+        List<Map<String, Object>> entries = List.of(
+                Map.of("Source", "my.app", "DetailType", "Test", "Detail", "{}", "Resources", resources)
+        );
+
+        EventBridgeService.PutEventsResult result = service.putEvents(entries, REGION);
+        assertEquals(0, result.failedCount());
+        assertEquals(1, result.entries().size());
+        assertNotNull(result.entries().getFirst().get("EventId"));
+        verify(invokerMock).invokeTarget(eq(target), any(String.class), eq(REGION));
+    }
+
+    @Test
+    void putEventsShouldInvokeSnsTarget() {
+        service.putRule("my-rule", null, "{\"source\":[\"my.app\"]}", null, RuleState.ENABLED,
+                "A test rule", null, null, REGION);
+        Target target = new Target();
+        target.setId("t1");
+        target.setArn("arn:aws:sns:us-east-1:000000000000:my-topic");
+        service.putTargets("my-rule", null, List.of(target), "us-east-1");
+
+        ArrayNode resources = OBJECT_MAPPER.createArrayNode().add("resource1");
+        List<Map<String, Object>> entries = List.of(
+                Map.of("Source", "my.app", "DetailType", "Test", "Detail", "{}", "Resources", resources)
+        );
+
+        EventBridgeService.PutEventsResult result = service.putEvents(entries, REGION);
+        assertEquals(0, result.failedCount());
+        assertEquals(1, result.entries().size());
+        assertNotNull(result.entries().getFirst().get("EventId"));
+        verify(invokerMock).invokeTarget(eq(target), any(String.class), eq(REGION));
+    }
+
+    @Test
+    void matchesPatternBySourcePrefix_matches() {
+        Map<String, Object> event = Map.of("Source", "com.example.myapp", "DetailType", "Order");
+        assertTrue(service.matchesPattern(event, "{\"source\":[{\"prefix\":\"com.example\"}]}"));
+    }
+
+    @Test
+    void matchesPatternBySourcePrefix_noMatch() {
+        Map<String, Object> event = Map.of("Source", "org.example.myapp", "DetailType", "Order");
+        assertFalse(service.matchesPattern(event, "{\"source\":[{\"prefix\":\"com.example\"}]}"));
+    }
+
+    @Test
+    void matchesPatternBySuffix_matches() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "order.json");
+        assertTrue(service.matchesPattern(event, "{\"detail-type\":[{\"suffix\":\".json\"}]}"));
+    }
+
+    @Test
+    void matchesPatternBySuffix_noMatch() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "order.xml");
+        assertFalse(service.matchesPattern(event, "{\"detail-type\":[{\"suffix\":\".json\"}]}"));
+    }
+
+    @Test
+    void matchesPatternByEqualsIgnoreCase_matches() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "PROD");
+        assertTrue(service.matchesPattern(event, "{\"detail-type\":[{\"equals-ignore-case\":\"prod\"}]}"));
+    }
+
+    @Test
+    void matchesPatternByEqualsIgnoreCase_noMatch() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "PROD");
+        assertFalse(service.matchesPattern(event, "{\"detail-type\":[{\"equals-ignore-case\":\"dev\"}]}"));
+    }
+
+    @Test
+    void matchesPatternByAnythingBut_matches() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "Order");
+        assertTrue(service.matchesPattern(event, "{\"detail-type\":[{\"anything-but\":[\"Payment\"]}]}"));
+    }
+
+    @Test
+    void matchesPatternByAnythingBut_noMatch() {
+        Map<String, Object> event = Map.of("Source", "my.app", "DetailType", "Payment");
+        assertFalse(service.matchesPattern(event, "{\"detail-type\":[{\"anything-but\":[\"Payment\"]}]}"));
+    }
+
+    @Test
+    void matchesPatternByAnythingButPrefix_matches() {
+        Map<String, Object> event = Map.of("Source", "com.example.app", "DetailType", "Order");
+        assertTrue(service.matchesPattern(event, "{\"source\":[{\"anything-but\":{\"prefix\":\"aws.\"}}]}"));
+    }
+
+    @Test
+    void matchesPatternByAnythingButPrefix_noMatch() {
+        Map<String, Object> event = Map.of("Source", "aws.events", "DetailType", "Order");
+        assertFalse(service.matchesPattern(event, "{\"source\":[{\"anything-but\":{\"prefix\":\"aws.\"}}]}"));
+    }
+
+    @Test
+    void matchesPatternByDetailPrefixField_matches() {
+        Map<String, Object> event = Map.of(
+                "Source", "my.app",
+                "Detail", "{\"status\":\"CONFIRMED_BY_USER\"}"
+        );
+        assertTrue(service.matchesPattern(event, "{\"detail\":{\"status\":[{\"prefix\":\"CONFIRMED\"}]}}"));
+    }
+
+    @Test
+    void matchesPatternByExists_matches() {
+        Map<String, Object> event = Map.of(
+                "Source", "my.app",
+                "Detail", "{\"status\":\"CONFIRMED\"}"
+        );
+        assertTrue(service.matchesPattern(event, "{\"detail\":{\"status\":[{\"exists\":true}]}}"));
+        assertTrue(service.matchesPattern(event, "{\"detail\":{\"other\":[{\"exists\":false}]}}"));
+    }
+    }

@@ -2,7 +2,7 @@
 
 ## Minimal Setup
 
-For most services (SSM, SQS, SNS, S3, DynamoDB, Lambda, API Gateway, Cognito, KMS, Kinesis, Secrets Manager, CloudFormation, Step Functions, IAM, STS, EventBridge, CloudWatch) a single port is enough:
+For most services (SSM, SQS, SNS, S3, DynamoDB, Lambda, API Gateway, Cognito, KMS, Kinesis, Secrets Manager, CloudFormation, Step Functions, IAM, STS, EventBridge, Scheduler, CloudWatch) a single port is enough:
 
 ```yaml title="docker-compose.yml"
 services:
@@ -12,6 +12,8 @@ services:
       - "4566:4566"
     volumes:
       - ./data:/app/data
+      - ./init/start.d:/etc/floci/init/start.d:ro
+      - ./init/stop.d:/etc/floci/init/stop.d:ro
 ```
 
 ## Full Setup (with ElastiCache and RDS)
@@ -38,6 +40,70 @@ services:
 !!! warning "Docker socket"
     Lambda, ElastiCache, and RDS require access to the Docker socket (`/var/run/docker.sock`) to spawn and manage containers. If you don't use these services, you can omit that volume.
 
+!!! note "ECR ports are not listed here intentionally"
+    ECR is backed by a separate `registry:2` sidecar container (`floci-ecr-registry`) that Floci starts and manages. That container binds its own host port (default `5100`) directly — adding `5100-5199` to the floci service's `ports` would conflict with the sidecar and break `docker push`/`docker pull`. See [Ports Reference → ECR](./ports.md#ports-51005199--ecr-registry) for details.
+
+## Multi-container networking
+
+By default, Floci embeds `localhost` in response URLs — for example, SQS queue
+URLs look like `http://localhost:4566/000000000000/my-queue`. This is fine when
+your application runs on the same machine, but breaks inside Docker Compose:
+other containers cannot reach `localhost` of the Floci container.
+
+Set `FLOCI_HOSTNAME` to the Compose service name so that Floci uses that name
+in every URL it generates:
+
+```yaml title="docker-compose.yml"
+services:
+  floci:
+    image: hectorvent/floci:latest
+    ports:
+      - "4566:4566"
+    environment:
+      FLOCI_HOSTNAME: floci   # (1)
+
+  app:
+    build: .
+    environment:
+      AWS_ENDPOINT_URL: http://floci:4566
+    depends_on:
+      - floci
+```
+
+1. Must match the Compose service name so other containers can resolve it.
+
+With this setting Floci returns URLs like
+`http://floci:4566/000000000000/my-queue` that other containers in the same
+network can reach.
+
+This affects any response field that embeds the endpoint hostname:
+
+- SQS — `QueueUrl`
+- SNS — `TopicArn` callback URLs and subscription `SubscriptionArn` endpoints
+- Any pre-signed URL or callback that is generated from `floci.base-url`
+
+!!! tip "CI pipelines"
+    In GitHub Actions or GitLab CI where both your app and Floci run as
+    `services`, set `FLOCI_HOSTNAME` to the service name (e.g. `floci`) and
+    point your SDK at `http://floci:4566`.
+
+## Initialization Hooks
+
+Hook scripts can be mounted into the container to run custom setup and teardown logic:
+
+```yaml
+services:
+  floci:
+    image: hectorvent/floci:latest
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./init/start.d:/etc/floci/init/start.d:ro
+      - ./init/stop.d:/etc/floci/init/stop.d:ro
+```
+
+See [Initialization Hooks](./initialization-hooks.md) for execution behavior and configuration details.
+
 ## Persistence
 
 By default Floci stores all data in memory — data is lost on restart. To persist data to disk, set the storage path and enable persistent mode:
@@ -55,12 +121,35 @@ services:
       FLOCI_STORAGE_PERSISTENT_PATH: /app/data
 ```
 
+### Using Named Volumes
+
+Instead of bind-mounting a local directory, you can use Docker named volumes to keep your project directory clean:
+
+```yaml
+services:
+  floci:
+    image: hectorvent/floci:latest
+    ports:
+      - "4566:4566"
+    volumes:
+      - floci-data:/app/data
+    environment:
+      FLOCI_STORAGE_MODE: persistent
+      FLOCI_STORAGE_PERSISTENT_PATH: /app/data
+
+volumes:
+  floci-data:
+```
+
+Named volumes are managed entirely by Docker and won't create files in your repository. This works with both the JVM and native images.
+
 ## Environment Variables Reference
 
 All `application.yml` options can be overridden via environment variables using the `FLOCI_` prefix with underscores replacing dots and dashes:
 
 | Environment variable | Default | Description |
 |---|---|---|
+| `FLOCI_HOSTNAME` | _(none)_ | Hostname embedded in response URLs (SQS, SNS, pre-signed). Set to the Compose service name in multi-container setups |
 | `FLOCI_DEFAULT_REGION` | `us-east-1` | AWS region reported in ARNs |
 | `FLOCI_DEFAULT_ACCOUNT_ID` | `000000000000` | AWS account ID used in ARNs |
 | `FLOCI_STORAGE_MODE` | `memory` | Global storage mode (`memory`, `persistent`, `hybrid`, `wal`) |
@@ -93,7 +182,7 @@ services:
 steps:
   - name: Run tests
     env:
-      AWS_ENDPOINT: http://localhost:4566
+      AWS_ENDPOINT_URL: http://localhost:4566
       AWS_DEFAULT_REGION: us-east-1
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test

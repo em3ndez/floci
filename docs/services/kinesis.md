@@ -26,42 +26,56 @@
 | `AddTagsToStream` | Tag a stream |
 | `RemoveTagsFromStream` | Remove tags |
 | `ListTagsForStream` | List tags |
+| `IncreaseStreamRetentionPeriod` | Increase retention up to 8760 hours (365 days) |
+| `DecreaseStreamRetentionPeriod` | Decrease retention down to 24 hours |
 | `StartStreamEncryption` | Enable KMS encryption |
 | `StopStreamEncryption` | Disable encryption |
+
+## Stream Addressing
+
+Most actions accept either `StreamName` or `StreamARN` to identify a stream. When both are provided, `StreamName` takes precedence. `CreateStream` only accepts `StreamName`.
+
+```bash
+# By name
+aws kinesis describe-stream --stream-name events --endpoint-url $AWS_ENDPOINT_URL
+
+# By ARN
+aws kinesis describe-stream --stream-arn arn:aws:kinesis:us-east-1:000000000000:stream/events --endpoint-url $AWS_ENDPOINT_URL
+```
 
 ## Examples
 
 ```bash
-export AWS_ENDPOINT=http://localhost:4566
+export AWS_ENDPOINT_URL=http://localhost:4566
 
 # Create a stream
 aws kinesis create-stream \
   --stream-name events \
   --shard-count 2 \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Put a record
 aws kinesis put-record \
   --stream-name events \
   --partition-key "user-123" \
   --data '{"event":"page_view","page":"/home"}' \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Get a shard iterator
 SHARD_ID=$(aws kinesis describe-stream \
   --stream-name events \
   --query 'StreamDescription.Shards[0].ShardId' --output text \
-  --endpoint-url $AWS_ENDPOINT)
+  --endpoint-url $AWS_ENDPOINT_URL)
 
 ITERATOR=$(aws kinesis get-shard-iterator \
   --stream-name events \
   --shard-id $SHARD_ID \
   --shard-iterator-type TRIM_HORIZON \
   --query ShardIterator --output text \
-  --endpoint-url $AWS_ENDPOINT)
+  --endpoint-url $AWS_ENDPOINT_URL)
 
 # Read records
 aws kinesis get-records \
   --shard-iterator $ITERATOR \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 ```

@@ -19,7 +19,11 @@ public class KmsKey {
     private String customerMasterKeySpec = "SYMMETRIC_DEFAULT";
     private long creationDate;
     private long deletionDate;
+    private String policy;
+    private boolean keyRotationEnabled = false;
     private Map<String, String> tags = new HashMap<>();
+    private String privateKeyEncoded;
+    private String publicKeyEncoded;
 
     public KmsKey() {
         this.creationDate = Instant.now().getEpochSecond();
@@ -52,6 +56,18 @@ public class KmsKey {
     public long getDeletionDate() { return deletionDate; }
     public void setDeletionDate(long deletionDate) { this.deletionDate = deletionDate; }
 
+    public String getPolicy() { return policy; }
+    public void setPolicy(String policy) { this.policy = policy; }
+
+    public boolean isKeyRotationEnabled() { return keyRotationEnabled; }
+    public void setKeyRotationEnabled(boolean keyRotationEnabled) { this.keyRotationEnabled = keyRotationEnabled; }
+
     public Map<String, String> getTags() { return tags; }
     public void setTags(Map<String, String> tags) { this.tags = tags; }
+
+    public String getPrivateKeyEncoded() { return privateKeyEncoded; }
+    public void setPrivateKeyEncoded(String privateKeyEncoded) { this.privateKeyEncoded = privateKeyEncoded; }
+
+    public String getPublicKeyEncoded() { return publicKeyEncoded; }
+    public void setPublicKeyEncoded(String publicKeyEncoded) { this.publicKeyEncoded = publicKeyEncoded; }
 }

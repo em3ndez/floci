@@ -4,19 +4,23 @@ ARG VERSION=latest
 ARG BINARY_FILE=application
 
 ENV FLOCI_VERSION=${VERSION}
+ENV FLOCI_STORAGE_PERSISTENT_PATH=/app/data
 
 WORKDIR /app
 
-VOLUME /app/data
+RUN mkdir -p /app/data \
+    && chown -R 1001:root /app \
+    && chmod -R g+rwX /app
 
-RUN chown 1001 /app \
-    && chmod "g+rwX" /app \
-    && chown 1001:root /app
+VOLUME /app/data
 
 COPY --chown=1001:root target/*.properties target/*.so /app/
 COPY --chown=1001:root target/*-runner /app/application
 
 EXPOSE 4566
+
+HEALTHCHECK --interval=5s --timeout=3s --retries=5 \
+    CMD curl -f http://localhost:4566/_floci/health || exit 1
 
 USER 1001
 

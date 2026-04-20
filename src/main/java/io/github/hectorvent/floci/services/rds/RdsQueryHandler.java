@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.rds;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
@@ -28,14 +29,16 @@ public class RdsQueryHandler {
     private static final Logger LOG = Logger.getLogger(RdsQueryHandler.class);
 
     private final RdsService service;
+    private final EmulatorConfig config;
 
     @Inject
-    public RdsQueryHandler(RdsService service) {
+    public RdsQueryHandler(RdsService service, EmulatorConfig config) {
         this.service = service;
+        this.config = config;
     }
 
     public Response handle(String action, MultivaluedMap<String, String> params) {
-        LOG.debugv("RDS action: {0}", action);
+        LOG.infov("RDS action: {0}", action);
         try {
             return switch (action) {
                 case "CreateDBInstance" -> handleCreateDbInstance(params);
@@ -104,11 +107,14 @@ public class RdsQueryHandler {
 
     private Response handleDescribeDbInstances(MultivaluedMap<String, String> params) {
         String filterId = params.getFirst("DBInstanceIdentifier");
+        if (filterId == null || filterId.isBlank()) {
+            filterId = extractRdsFilterValue(params, "db-instance-id");
+        }
         try {
             Collection<DbInstance> result = service.listDbInstances(filterId);
             XmlBuilder xml = new XmlBuilder().start("DBInstances");
             for (DbInstance i : result) {
-                xml.start("member").raw(dbInstanceInnerXml(i)).end("member");
+                xml.start("DBInstance").raw(dbInstanceInnerXml(i)).end("DBInstance");
             }
             xml.end("DBInstances").start("Marker").end("Marker");
             return Response.ok(AwsQueryResponse.envelope("DescribeDBInstances", AwsNamespaces.RDS, xml.build())).build();
@@ -195,11 +201,14 @@ public class RdsQueryHandler {
 
     private Response handleDescribeDbClusters(MultivaluedMap<String, String> params) {
         String filterId = params.getFirst("DBClusterIdentifier");
+        if (filterId == null || filterId.isBlank()) {
+            filterId = extractRdsFilterValue(params, "db-cluster-id");
+        }
         try {
             Collection<DbCluster> result = service.listDbClusters(filterId);
             XmlBuilder xml = new XmlBuilder().start("DBClusters");
             for (DbCluster c : result) {
-                xml.start("member").raw(dbClusterInnerXml(c)).end("member");
+                xml.start("DBCluster").raw(dbClusterInnerXml(c)).end("DBCluster");
             }
             xml.end("DBClusters").start("Marker").end("Marker");
             return Response.ok(AwsQueryResponse.envelope("DescribeDBClusters", AwsNamespaces.RDS, xml.build())).build();
@@ -264,7 +273,7 @@ public class RdsQueryHandler {
             Collection<DbParameterGroup> result = service.listDbParameterGroups(filterName);
             XmlBuilder xml = new XmlBuilder().start("DBParameterGroups");
             for (DbParameterGroup g : result) {
-                xml.start("member").raw(paramGroupInnerXml(g)).end("member");
+                xml.start("DBParameterGroup").raw(paramGroupInnerXml(g)).end("DBParameterGroup");
             }
             xml.end("DBParameterGroups").start("Marker").end("Marker");
             return Response.ok(AwsQueryResponse.envelope("DescribeDBParameterGroups", AwsNamespaces.RDS, xml.build())).build();
@@ -366,7 +375,32 @@ public class RdsQueryHandler {
         xml.elem("IAMDatabaseAuthenticationEnabled", i.isIamDatabaseAuthenticationEnabled())
            .elem("MultiAZ", false)
            .elem("StorageType", "gp2")
-           .elem("PubliclyAccessible", false);
+           .elem("PubliclyAccessible", false)
+           .elem("AvailabilityZone", config.defaultAvailabilityZone())
+           .elem("PreferredMaintenanceWindow", "mon:00:00-mon:03:00")
+           .elem("PreferredBackupWindow", "04:00-06:00")
+           .start("VpcSecurityGroups")
+             .start("VpcSecurityGroupMembership")
+               .elem("VpcSecurityGroupId", "sg-00000000")
+               .elem("Status", "active")
+             .end("VpcSecurityGroupMembership")
+           .end("VpcSecurityGroups")
+           .start("DBSubnetGroup")
+             .elem("DBSubnetGroupName", "default")
+             .elem("VpcId", "vpc-00000000")
+             .elem("SubnetGroupStatus", "Complete")
+             .start("Subnets")
+               .start("member")
+                 .elem("SubnetIdentifier", "subnet-00000000")
+                 .start("SubnetAvailabilityZone")
+                   .elem("Name", config.defaultAvailabilityZone())
+                 .end("SubnetAvailabilityZone")
+                 .elem("SubnetStatus", "Active")
+               .end("member")
+             .end("Subnets")
+           .end("DBSubnetGroup")
+           .elem("DbiResourceId", i.getDbiResourceId())
+           .elem("DBInstanceArn", i.getDbInstanceArn());
         if (i.getDbClusterIdentifier() != null && !i.getDbClusterIdentifier().isBlank()) {
             xml.elem("DBClusterIdentifier", i.getDbClusterIdentifier());
         }
@@ -401,6 +435,31 @@ public class RdsQueryHandler {
         }
         xml.elem("IAMDatabaseAuthenticationEnabled", c.isIamDatabaseAuthenticationEnabled())
            .elem("MultiAZ", false)
+           .elem("AvailabilityZone", config.defaultAvailabilityZone())
+           .elem("PreferredMaintenanceWindow", "mon:00:00-mon:03:00")
+           .elem("PreferredBackupWindow", "04:00-06:00")
+           .start("VpcSecurityGroups")
+             .start("VpcSecurityGroupMembership")
+               .elem("VpcSecurityGroupId", "sg-00000000")
+               .elem("Status", "active")
+             .end("VpcSecurityGroupMembership")
+           .end("VpcSecurityGroups")
+           .start("DBSubnetGroup")
+             .elem("DBSubnetGroupName", "default")
+             .elem("VpcId", "vpc-00000000")
+             .elem("SubnetGroupStatus", "Complete")
+             .start("Subnets")
+               .start("member")
+                 .elem("SubnetIdentifier", "subnet-00000000")
+                 .start("SubnetAvailabilityZone")
+                   .elem("Name", config.defaultAvailabilityZone())
+                 .end("SubnetAvailabilityZone")
+                 .elem("SubnetStatus", "Active")
+               .end("member")
+             .end("Subnets")
+           .end("DBSubnetGroup")
+           .elem("DbClusterResourceId", c.getDbClusterResourceId())
+           .elem("DBClusterArn", c.getDbClusterArn())
            .start("DBClusterMembers");
         if (c.getDbClusterMembers() != null) {
             for (String memberId : c.getDbClusterMembers()) {
@@ -434,6 +493,24 @@ public class RdsQueryHandler {
             case REBOOTING -> "rebooting";
             case MODIFYING -> "modifying";
         };
+    }
+
+    /**
+     * Extracts the first value for a named filter from RDS Query API encoded params:
+     * {@code Filters.Filter.N.Name=filterName} / {@code Filters.Filter.N.Values.Value.1=value}.
+     * Returns null if no matching filter is present.
+     */
+    private static String extractRdsFilterValue(MultivaluedMap<String, String> params, String filterName) {
+        for (int i = 1; ; i++) {
+            String name = params.getFirst("Filters.Filter." + i + ".Name");
+            if (name == null) {
+                break;
+            }
+            if (filterName.equals(name)) {
+                return params.getFirst("Filters.Filter." + i + ".Values.Value.1");
+            }
+        }
+        return null;
     }
 
     private static int parseIntSafe(String value, int defaultValue) {

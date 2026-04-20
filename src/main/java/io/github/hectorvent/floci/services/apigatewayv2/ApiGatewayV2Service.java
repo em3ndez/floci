@@ -185,12 +185,19 @@ public class ApiGatewayV2Service {
         String pattern = routeKey.substring(space + 1);
         if (!method.equalsIgnoreCase(httpMethod)) return false;
 
-        // Convert path template to regex: {param} → [^/]+, {proxy+} → .+
-        String regex = "^" + Pattern.quote(pattern)
-                .replace("\\{proxy+\\}", "\\E.+\\Q")
-                .replace("\\{", "\\E[^/]+\\Q")
-                .replaceAll("\\\\Q\\\\E", "") + "$";
-        return path.matches(regex);
+        // Build regex from path template: {proxy+} -> .+, {param} -> [^/]+
+        // Quote literal segments to avoid regex injection from path patterns
+        StringBuilder regex = new StringBuilder("^");
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\{([^}]*)}").matcher(pattern);
+        int last = 0;
+        while (m.find()) {
+            regex.append(Pattern.quote(pattern.substring(last, m.start())));
+            regex.append(m.group(1).endsWith("+") ? ".*" : "[^/]+");
+            last = m.end();
+        }
+        regex.append(Pattern.quote(pattern.substring(last)));
+        regex.append("$");
+        return path.matches(regex.toString());
     }
 
     // ──────────────────────────── Integration CRUD ────────────────────────────
@@ -217,12 +224,18 @@ public class ApiGatewayV2Service {
         return integrationStore.scan(k -> k.startsWith(prefix));
     }
 
+    public void deleteIntegration(String region, String apiId, String integrationId) {
+        getIntegration(region, apiId, integrationId);
+        integrationStore.delete(integrationKey(region, apiId, integrationId));
+    }
+
     // ──────────────────────────── Stage CRUD ────────────────────────────
 
     public Stage createStage(String region, String apiId, Map<String, Object> request) {
         getApi(region, apiId);
         Stage stage = new Stage();
         stage.setStageName((String) request.getOrDefault("stageName", "$default"));
+        stage.setDeploymentId((String) request.get("deploymentId"));
         stage.setAutoDeploy(Boolean.parseBoolean(String.valueOf(request.getOrDefault("autoDeploy", "false"))));
         stage.setCreatedDate(System.currentTimeMillis());
         stage.setLastUpdatedDate(System.currentTimeMillis());
@@ -251,6 +264,16 @@ public class ApiGatewayV2Service {
 
     public Deployment createDeployment(String region, String apiId, Map<String, Object> request) {
         getApi(region, apiId);
+
+        // Validate stage exists before creating deployment to avoid orphans
+        String stageName = (String) request.get("stageName");
+        Stage stage = null;
+        if (stageName != null && !stageName.isBlank()) {
+            stage = stageStore.get(stageKey(region, apiId, stageName))
+                    .orElseThrow(() -> new AwsException("NotFoundException",
+                            "Stage " + stageName + " not found", 404));
+        }
+
         Deployment deployment = new Deployment();
         deployment.setDeploymentId(shortId(8));
         deployment.setDeploymentStatus("DEPLOYED");
@@ -258,12 +281,29 @@ public class ApiGatewayV2Service {
         deployment.setCreatedDate(System.currentTimeMillis());
 
         deploymentStore.put(deploymentKey(region, apiId, deployment.getDeploymentId()), deployment);
+
+        if (stage != null) {
+            stage.setDeploymentId(deployment.getDeploymentId());
+            stage.setLastUpdatedDate(System.currentTimeMillis());
+            stageStore.put(stageKey(region, apiId, stageName), stage);
+        }
+
         return deployment;
+    }
+
+    public Deployment getDeployment(String region, String apiId, String deploymentId) {
+        return deploymentStore.get(deploymentKey(region, apiId, deploymentId))
+                .orElseThrow(() -> new AwsException("NotFoundException", "Deployment not found", 404));
     }
 
     public List<Deployment> getDeployments(String region, String apiId) {
         String prefix = region + "::" + apiId + "::";
         return deploymentStore.scan(k -> k.startsWith(prefix));
+    }
+
+    public void deleteDeployment(String region, String apiId, String deploymentId) {
+        getDeployment(region, apiId, deploymentId);
+        deploymentStore.delete(deploymentKey(region, apiId, deploymentId));
     }
 
     // ──────────────────────────── Key helpers ────────────────────────────

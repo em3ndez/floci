@@ -13,11 +13,15 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.net.URI;
 import java.time.Instant;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * CloudFormation stack lifecycle management — Create, Update, Delete stacks via ChangeSets.
@@ -48,7 +52,7 @@ public class CloudFormationService {
 
     public List<Stack> describeStacks(String stackName, String region) {
         if (stackName != null && !stackName.isBlank()) {
-            Stack stack = stacks.get(key(stackName, region));
+            Stack stack = resolveStack(stackName, region);
             if (stack == null) {
                 throw new AwsException("ValidationError",
                         "Stack with id " + stackName + " does not exist", 400);
@@ -106,7 +110,7 @@ public class CloudFormationService {
 
     // ── ExecuteChangeSet ──────────────────────────────────────────────────────
 
-    public void executeChangeSet(String stackName, String changeSetName, String region) {
+    public Future<?> executeChangeSet(String stackName, String changeSetName, String region) {
         Stack stack = getStackOrThrow(stackName, region);
         ChangeSet cs = stack.getChangeSets().get(changeSetName);
         if (cs == null) {
@@ -125,7 +129,7 @@ public class CloudFormationService {
         String templateBody = cs.getTemplateBody();
         Map<String, String> params = cs.getParameters() != null ? cs.getParameters() : Map.of();
 
-        executor.submit(() -> executeTemplate(stack, templateBody, params, isCreate, region));
+        return executor.submit(() -> executeTemplate(stack, templateBody, params, isCreate, region));
     }
 
     // ── DeleteChangeSet ───────────────────────────────────────────────────────
@@ -143,7 +147,7 @@ public class CloudFormationService {
     // ── DeleteStack ───────────────────────────────────────────────────────────
 
     public void deleteStack(String stackName, String region) {
-        Stack stack = stacks.get(key(stackName, region));
+        Stack stack = resolveStack(stackName, region);
         if (stack == null) {
             return; // Already gone — no-op
         }
@@ -200,6 +204,10 @@ public class CloudFormationService {
             // Resolve conditions first
             Map<String, Boolean> conditions = resolveConditions(template, resolvedParams, stack, region);
 
+            // Mappings
+            Map<String, JsonNode> mappings = new HashMap<>();
+            template.path("Mappings").fields().forEachRemaining(e -> mappings.put(e.getKey(), e.getValue()));
+
             // Process resources in order
             JsonNode resources = template.path("Resources");
             Map<String, String> physicalIds = new LinkedHashMap<>();
@@ -214,17 +222,16 @@ public class CloudFormationService {
             }
 
             if (resources.isObject()) {
-                Iterator<Map.Entry<String, JsonNode>> it = resources.fields();
-                while (it.hasNext()) {
-                    var entry = it.next();
-                    String logicalId = entry.getKey();
-                    JsonNode resDef = entry.getValue();
+                List<String> sortedLogicalIds = topologicalSort(resources, conditions);
+
+                for (String logicalId : sortedLogicalIds) {
+                    JsonNode resDef = resources.get(logicalId);
                     String type = resDef.path("Type").asText();
                     JsonNode props = resDef.path("Properties");
 
                     CloudFormationTemplateEngine engine = new CloudFormationTemplateEngine(
                             config.defaultAccountId(), region, stack.getStackName(),
-                            stack.getStackId(), resolvedParams, physicalIds, resourceAttrs, conditions, objectMapper);
+                            stack.getStackId(), resolvedParams, physicalIds, resourceAttrs, conditions, mappings, objectMapper);
 
                     StackResource resource = stack.getResources().get(logicalId);
                     if (resource == null) {
@@ -236,7 +243,7 @@ public class CloudFormationService {
 
                     addEvent(stack, logicalId, null, type, "CREATE_IN_PROGRESS", null);
                     resource = provisioner.provision(logicalId, type, props.isMissingNode() ? null : props,
-                            engine, region, config.defaultAccountId());
+                            engine, region, config.defaultAccountId(), stack.getStackName());
                     stack.getResources().put(logicalId, resource);
 
                     physicalIds.put(logicalId, resource.getPhysicalId());
@@ -251,7 +258,7 @@ public class CloudFormationService {
             stack.getOutputs().clear();
             CloudFormationTemplateEngine finalEngine = new CloudFormationTemplateEngine(
                     config.defaultAccountId(), region, stack.getStackName(),
-                    stack.getStackId(), resolvedParams, physicalIds, resourceAttrs, conditions, objectMapper);
+                    stack.getStackId(), resolvedParams, physicalIds, resourceAttrs, conditions, mappings, objectMapper);
 
             JsonNode outputs = template.path("Outputs");
             if (outputs.isObject()) {
@@ -420,20 +427,29 @@ public class CloudFormationService {
 
     private String fetchTemplateFromS3(String url) {
         try {
-            // Parse S3 URL: http://host:port/bucket/key or https://bucket.s3.amazonaws.com/key
+            // Parse S3 URL:
+            // Virtual-hosted local: http://bucket.localhost:4566/key
+            // Virtual-hosted AWS:   https://bucket.s3.region.amazonaws.com/key
+            // Path-style:           http://host:port/bucket/key
             String bucket;
             String key;
-            if (url.contains(".s3.amazonaws.com") || url.contains(".s3.")) {
-                // Virtual-hosted: https://bucket.s3.region.amazonaws.com/key
-                String host = url.replaceFirst("https?://", "").split("/")[0];
+
+            URI uri = URI.create(url);
+            String host = uri.getHost();
+            String path = uri.getRawPath();
+
+            if (host != null && (host.contains(".s3.") || host.endsWith(".amazonaws.com") ||
+                    (config.hostname().isPresent() && host.endsWith("." + config.hostname().get())) ||
+                    (host.endsWith(".localhost")))) {
+                // Virtual-hosted style
                 bucket = host.split("\\.")[0];
-                key = url.substring(url.indexOf('/', url.indexOf("://") + 3) + 1);
+                key = path.startsWith("/") ? path.substring(1) : path;
             } else {
-                // Path-style: http://host:port/bucket/key
-                String path = url.replaceFirst("https?://[^/]+/", "");
-                int slash = path.indexOf('/');
-                bucket = slash > 0 ? path.substring(0, slash) : path;
-                key = slash > 0 ? path.substring(slash + 1) : "";
+                // Path-style: /bucket/key
+                String rawPath = path.startsWith("/") ? path.substring(1) : path;
+                int slash = rawPath.indexOf('/');
+                bucket = slash > 0 ? rawPath.substring(0, slash) : rawPath;
+                key = slash > 0 ? rawPath.substring(slash + 1) : "";
             }
             var obj = s3Service.getObject(bucket, key);
             return new String(obj.getData());
@@ -468,13 +484,198 @@ public class CloudFormationService {
         stack.getEvents().add(event);
     }
 
-    private Stack getStackOrThrow(String stackName, String region) {
-        Stack stack = stacks.get(key(stackName, region));
+    private Stack getStackOrThrow(String stackNameOrArn, String region) {
+        Stack stack = resolveStack(stackNameOrArn, region);
         if (stack == null) {
             throw new AwsException("ValidationError",
-                    "Stack with id " + stackName + " does not exist", 400);
+                    "Stack with id " + stackNameOrArn + " does not exist", 400);
         }
         return stack;
+    }
+
+    /**
+     * Resolves a stack by name or ARN. When an ARN is provided the stack name
+     * is extracted from the ARN path segment ({@code …:stack/<name>/<id>}).
+     * Falls back to a linear scan matching on stackId for robustness.
+     */
+    private Stack resolveStack(String stackNameOrArn, String region) {
+        // Try direct name lookup first (fast path)
+        Stack stack = stacks.get(key(stackNameOrArn, region));
+        if (stack != null) {
+            return stack;
+        }
+
+        // If input looks like an ARN, extract the stack name and retry
+        if (stackNameOrArn != null && stackNameOrArn.startsWith("arn:")) {
+            String extractedName = extractStackNameFromArn(stackNameOrArn);
+            if (extractedName != null) {
+                stack = stacks.get(key(extractedName, region));
+                if (stack != null) {
+                    return stack;
+                }
+            }
+            // Fallback: scan by stackId in case the ARN format is unexpected
+            for (Stack s : stacks.values()) {
+                if (stackNameOrArn.equals(s.getStackId())) {
+                    return s;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Extracts the stack name from a CloudFormation stack ARN.
+     * Expected format: {@code arn:aws:cloudformation:REGION:ACCOUNT:stack/STACK_NAME/UUID}
+     */
+    private static String extractStackNameFromArn(String arn) {
+        int stackSegment = arn.indexOf(":stack/");
+        if (stackSegment < 0) {
+            return null;
+        }
+        String afterStack = arn.substring(stackSegment + ":stack/".length());
+        int slash = afterStack.indexOf('/');
+        return slash > 0 ? afterStack.substring(0, slash) : afterStack;
+    }
+
+    private List<String> topologicalSort(JsonNode resources, Map<String, Boolean> conditions) {
+        Set<String> allIds = new LinkedHashSet<>();
+        resources.fieldNames().forEachRemaining(allIds::add);
+
+        Map<String, Set<String>> dependencies = new HashMap<>();
+        for (String logicalId : allIds) {
+            JsonNode resDef = resources.get(logicalId);
+
+            String condition = resDef.path("Condition").asText(null);
+            if (condition != null && !conditions.getOrDefault(condition, false)) {
+                continue;
+            }
+
+            Set<String> deps = new LinkedHashSet<>();
+            collectDependencies(resDef.path("Properties"), allIds, deps);
+
+            JsonNode dependsOn = resDef.path("DependsOn");
+            if (dependsOn.isTextual()) {
+                deps.add(dependsOn.asText());
+            } else if (dependsOn.isArray()) {
+                for (JsonNode d : dependsOn) {
+                    deps.add(d.asText());
+                }
+            }
+
+            dependencies.put(logicalId, deps);
+        }
+
+        Map<String, Integer> inDegree = new HashMap<>();
+        for (String id : allIds) {
+            inDegree.put(id, 0);
+        }
+        for (var entry : dependencies.entrySet()) {
+            for (String dep : entry.getValue()) {
+                if (inDegree.containsKey(dep)) {
+                    inDegree.put(entry.getKey(), inDegree.get(entry.getKey()) + 1);
+                }
+            }
+        }
+
+        Deque<String> queue = new ArrayDeque<>();
+        for (String id : allIds) {
+            if (inDegree.get(id) == 0) {
+                queue.add(id);
+            }
+        }
+
+        List<String> sorted = new ArrayList<>();
+        while (!queue.isEmpty()) {
+            String current = queue.poll();
+            sorted.add(current);
+            for (var entry : dependencies.entrySet()) {
+                if (entry.getValue().contains(current)) {
+                    int newDegree = inDegree.get(entry.getKey()) - 1;
+                    inDegree.put(entry.getKey(), newDegree);
+                    if (newDegree == 0) {
+                        queue.add(entry.getKey());
+                    }
+                }
+            }
+        }
+
+        for (String id : allIds) {
+            if (!sorted.contains(id)) {
+                sorted.add(id);
+            }
+        }
+
+        return sorted;
+    }
+
+    private static final Pattern SUB_VAR_PATTERN = Pattern.compile("\\$\\{([^}]+)}");
+
+    private void collectDependencies(JsonNode node, Set<String> allIds, Set<String> deps) {
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return;
+        }
+        if (node.isObject()) {
+            if (node.has("Ref")) {
+                String ref = node.get("Ref").asText();
+                if (allIds.contains(ref)) {
+                    deps.add(ref);
+                }
+                return;
+            }
+            if (node.has("Fn::GetAtt")) {
+                JsonNode getAtt = node.get("Fn::GetAtt");
+                String logicalId;
+                if (getAtt.isArray() && getAtt.size() >= 1) {
+                    logicalId = getAtt.get(0).asText();
+                } else {
+                    logicalId = getAtt.asText().split("\\.", 2)[0];
+                }
+                if (allIds.contains(logicalId)) {
+                    deps.add(logicalId);
+                }
+                return;
+            }
+            if (node.has("Fn::Sub")) {
+                collectSubDependencies(node.get("Fn::Sub"), allIds, deps);
+                return;
+            }
+            node.fields().forEachRemaining(e -> collectDependencies(e.getValue(), allIds, deps));
+        } else if (node.isArray()) {
+            for (JsonNode item : node) {
+                collectDependencies(item, allIds, deps);
+            }
+        }
+    }
+
+    private void collectSubDependencies(JsonNode sub, Set<String> allIds, Set<String> deps) {
+        String template;
+        Set<String> explicitVars = new HashSet<>();
+
+        if (sub.isTextual()) {
+            template = sub.textValue();
+        } else if (sub.isArray() && sub.size() >= 1) {
+            template = sub.get(0).asText();
+            if (sub.size() >= 2 && sub.get(1).isObject()) {
+                sub.get(1).fieldNames().forEachRemaining(explicitVars::add);
+                collectDependencies(sub.get(1), allIds, deps);
+            }
+        } else {
+            return;
+        }
+
+        Matcher matcher = SUB_VAR_PATTERN.matcher(template);
+        while (matcher.find()) {
+            String varName = matcher.group(1);
+            if (varName.startsWith("AWS::") || explicitVars.contains(varName)) {
+                continue;
+            }
+            int dot = varName.indexOf('.');
+            String resourcePart = dot > 0 ? varName.substring(0, dot) : varName;
+            if (allIds.contains(resourcePart)) {
+                deps.add(resourcePart);
+            }
+        }
     }
 
     private static String key(String stackName, String region) {

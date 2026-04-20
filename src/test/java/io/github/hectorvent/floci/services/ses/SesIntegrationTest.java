@@ -16,19 +16,24 @@ import static org.hamcrest.Matchers.*;
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class SesIntegrationTest {
 
+    private static String authorization(String service) {
+        return "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/" + service + "/aws4_request";
+    }
+
     @Test
     @Order(1)
     void verifyEmailIdentity() {
         given()
             .contentType("application/x-www-form-urlencoded")
-            .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request")
+            .header("Authorization", authorization("email"))
             .formParam("Action", "VerifyEmailIdentity")
             .formParam("EmailAddress", "sender@example.com")
         .when()
             .post("/")
         .then()
             .statusCode(200)
-            .body(containsString("VerifyEmailIdentityResponse"));
+            .body(containsString("VerifyEmailIdentityResponse"))
+            .body(containsString("VerifyEmailIdentityResult"));
     }
 
     @Test
@@ -36,7 +41,7 @@ class SesIntegrationTest {
     void verifyEmailIdentity_second() {
         given()
             .contentType("application/x-www-form-urlencoded")
-            .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request")
+            .header("Authorization", authorization("email"))
             .formParam("Action", "VerifyEmailIdentity")
             .formParam("EmailAddress", "recipient@example.com")
         .when()
@@ -50,7 +55,7 @@ class SesIntegrationTest {
     void verifyDomainIdentity() {
         given()
             .contentType("application/x-www-form-urlencoded")
-            .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request")
+            .header("Authorization", authorization("email"))
             .formParam("Action", "VerifyDomainIdentity")
             .formParam("Domain", "example.com")
         .when()
@@ -227,7 +232,21 @@ class SesIntegrationTest {
     void getAccountSendingEnabled() {
         given()
             .contentType("application/x-www-form-urlencoded")
-            .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request")
+            .header("Authorization", authorization("email"))
+            .formParam("Action", "GetAccountSendingEnabled")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Enabled>true</Enabled>"));
+    }
+
+    @Test
+    @Order(14)
+    void getAccountSendingEnabled_acceptsSesv2CredentialScopeAlias() {
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", authorization("sesv2"))
             .formParam("Action", "GetAccountSendingEnabled")
         .when()
             .post("/")
@@ -241,7 +260,7 @@ class SesIntegrationTest {
     void getIdentityDkimAttributes() {
         given()
             .contentType("application/x-www-form-urlencoded")
-            .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request")
+            .header("Authorization", authorization("email"))
             .formParam("Action", "GetIdentityDkimAttributes")
             .formParam("Identities.member.1", "example.com")
         .when()
@@ -265,7 +284,8 @@ class SesIntegrationTest {
         .when()
             .post("/")
         .then()
-            .statusCode(200);
+            .statusCode(200)
+            .body(containsString("SetIdentityNotificationTopicResult"));
     }
 
     @Test
@@ -320,7 +340,8 @@ class SesIntegrationTest {
         .when()
             .post("/")
         .then()
-            .statusCode(200);
+            .statusCode(200)
+            .body(containsString("DeleteIdentityResult"));
 
         // Verify it's gone
         given()
@@ -336,6 +357,91 @@ class SesIntegrationTest {
 
     @Test
     @Order(20)
+    void sendEmailV1_replyToAddressesStoredInInspection() {
+        given().delete("/_aws/ses").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/email/aws4_request")
+            .formParam("Action", "SendEmail")
+            .formParam("Source", "sender@example.com")
+            .formParam("Destination.ToAddresses.member.1", "recipient@example.com")
+            .formParam("ReplyToAddresses.member.1", "reply@example.com")
+            .formParam("Message.Subject.Data", "V1 ReplyTo")
+            .formParam("Message.Body.Text.Data", "body")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<MessageId>"));
+
+        given()
+        .when()
+            .get("/_aws/ses")
+        .then()
+            .statusCode(200)
+            .body("messages[0].ReplyToAddresses", hasItem("reply@example.com"));
+    }
+
+    @Test
+    @Order(21)
+    void deleteDomainIdentity() {
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", authorization("email"))
+            .formParam("Action", "DeleteIdentity")
+            .formParam("Identity", "example.com")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("DeleteIdentityResult"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", authorization("email"))
+            .formParam("Action", "ListIdentities")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("example.com")));
+    }
+
+    @Test
+    @Order(22)
+    void verifyEmailIdentity_rejectsLeadingTrailingWhitespace() {
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", authorization("email"))
+            .formParam("Action", "VerifyEmailIdentity")
+            .formParam("EmailAddress", " sender@example.com ")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidParameterValue"))
+            .body(containsString("leading or trailing whitespace"));
+    }
+
+    @Test
+    @Order(23)
+    void verifyDomainIdentity_rejectsLeadingTrailingWhitespace() {
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", authorization("email"))
+            .formParam("Action", "VerifyDomainIdentity")
+            .formParam("Domain", " example.com ")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidParameterValue"))
+            .body(containsString("leading or trailing whitespace"));
+    }
+
+    @Test
+    @Order(24)
     void unsupportedAction_returns400() {
         given()
             .contentType("application/x-www-form-urlencoded")

@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.core.storage;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -21,13 +22,15 @@ public class StorageFactory {
     private static final Logger LOG = Logger.getLogger(StorageFactory.class);
 
     private final EmulatorConfig config;
+    private final ServiceConfigAccess serviceConfigAccess;
     private final List<StorageBackend<?, ?>> allBackends = new ArrayList<>();
     private final List<HybridStorage<?, ?>> hybridBackends = new ArrayList<>();
     private final List<WalStorage<?, ?>> walBackends = new ArrayList<>();
 
     @Inject
-    public StorageFactory(EmulatorConfig config) {
+    public StorageFactory(EmulatorConfig config, ServiceConfigAccess serviceConfigAccess) {
         this.config = config;
+        this.serviceConfigAccess = serviceConfigAccess;
     }
 
     /**
@@ -98,30 +101,10 @@ public class StorageFactory {
     }
 
     private String resolveMode(String serviceName) {
-        return switch (serviceName) {
-            case "ssm" -> config.storage().services().ssm().mode();
-            case "sqs" -> config.storage().services().sqs().mode();
-            case "s3" -> config.storage().services().s3().mode();
-            case "dynamodb" -> config.storage().services().dynamodb().mode();
-            case "sns" -> config.storage().services().sns().mode();
-            case "lambda" -> config.storage().services().lambda().mode();
-            case "cloudwatchlogs" -> config.storage().services().cloudwatchlogs().mode();
-            case "cloudwatchmetrics" -> config.storage().services().cloudwatchmetrics().mode();
-            case "secretsmanager" -> config.storage().services().secretsmanager().mode();
-            default -> config.storage().mode();
-        };
+        return serviceConfigAccess.storageMode(serviceName);
     }
 
     private long resolveFlushInterval(String serviceName) {
-        return switch (serviceName) {
-            case "ssm" -> config.storage().services().ssm().flushIntervalMs();
-            case "dynamodb" -> config.storage().services().dynamodb().flushIntervalMs();
-            case "sns" -> config.storage().services().sns().flushIntervalMs();
-            case "lambda" -> config.storage().services().lambda().flushIntervalMs();
-            case "cloudwatchlogs" -> config.storage().services().cloudwatchlogs().flushIntervalMs();
-            case "cloudwatchmetrics" -> config.storage().services().cloudwatchmetrics().flushIntervalMs();
-            case "secretsmanager" -> config.storage().services().secretsmanager().flushIntervalMs();
-            default -> 5000L;
-        };
+        return serviceConfigAccess.storageFlushInterval(serviceName);
     }
 }

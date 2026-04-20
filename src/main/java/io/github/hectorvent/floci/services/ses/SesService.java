@@ -1,8 +1,6 @@
 package io.github.hectorvent.floci.services.ses;
 
-import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ses.model.Identity;
@@ -25,27 +23,28 @@ public class SesService {
 
     private final StorageBackend<String, Identity> identityStore;
     private final StorageBackend<String, SentEmail> emailStore;
-    private final RegionResolver regionResolver;
+    private final StorageBackend<String, Boolean> accountSettingsStore;
 
     @Inject
-    public SesService(StorageFactory storageFactory, EmulatorConfig config,
-                      RegionResolver regionResolver) {
+    public SesService(StorageFactory storageFactory) {
         this.identityStore = storageFactory.create("ses", "ses-identities.json",
                 new TypeReference<Map<String, Identity>>() {});
         this.emailStore = storageFactory.create("ses", "ses-emails.json",
                 new TypeReference<Map<String, SentEmail>>() {});
-        this.regionResolver = regionResolver;
+        this.accountSettingsStore = storageFactory.create("ses", "ses-account-settings.json",
+                new TypeReference<Map<String, Boolean>>() {});
     }
 
     SesService(StorageBackend<String, Identity> identityStore,
                StorageBackend<String, SentEmail> emailStore,
-               RegionResolver regionResolver) {
+               StorageBackend<String, Boolean> accountSettingsStore) {
         this.identityStore = identityStore;
         this.emailStore = emailStore;
-        this.regionResolver = regionResolver;
+        this.accountSettingsStore = accountSettingsStore;
     }
 
     public Identity verifyEmailIdentity(String emailAddress, String region) {
+        validateIdentityWhitespace(emailAddress, "Email address");
         if (emailAddress == null || emailAddress.isBlank()) {
             throw new AwsException("InvalidParameterValue", "Email address is required.", 400);
         }
@@ -60,6 +59,7 @@ public class SesService {
     }
 
     public Identity verifyDomainIdentity(String domain, String region) {
+        validateIdentityWhitespace(domain, "Domain");
         if (domain == null || domain.isBlank()) {
             throw new AwsException("InvalidParameterValue", "Domain is required.", 400);
         }
@@ -74,8 +74,23 @@ public class SesService {
     }
 
     public void deleteIdentity(String identityValue, String region) {
+        if (identityValue == null || identityValue.isBlank()) {
+            return;
+        }
         String key = identityKey(region, identityValue);
         identityStore.delete(key);
+
+        String prefix = "identity::" + region + "::";
+        List<String> keys = new ArrayList<>(identityStore.keys().stream()
+                .filter(k -> k.startsWith(prefix))
+                .toList());
+        for (String storedKey : keys) {
+            Identity storedIdentity = identityStore.get(storedKey).orElse(null);
+            if (storedIdentity != null && identityValue.equals(storedIdentity.getIdentity())) {
+                identityStore.delete(storedKey);
+            }
+        }
+
         LOG.infov("Deleted identity: {0}", identityValue);
     }
 
@@ -96,18 +111,21 @@ public class SesService {
     }
 
     public String sendEmail(String source, List<String> toAddresses, List<String> ccAddresses,
-                            List<String> bccAddresses, String subject, String bodyText,
-                            String bodyHtml, String region) {
+                            List<String> bccAddresses, List<String> replyToAddresses,
+                            String subject, String bodyText, String bodyHtml, String region) {
         if (source == null || source.isBlank()) {
             throw new AwsException("InvalidParameterValue", "Source email is required.", 400);
         }
-        if (toAddresses == null || toAddresses.isEmpty()) {
+        boolean hasRecipient = (toAddresses != null && !toAddresses.isEmpty())
+                || (ccAddresses != null && !ccAddresses.isEmpty())
+                || (bccAddresses != null && !bccAddresses.isEmpty());
+        if (!hasRecipient) {
             throw new AwsException("InvalidParameterValue", "At least one destination address is required.", 400);
         }
 
         String messageId = UUID.randomUUID().toString();
-        String body = bodyHtml != null ? bodyHtml : bodyText;
-        SentEmail email = new SentEmail(messageId, source, toAddresses, ccAddresses, bccAddresses, subject, body);
+        SentEmail email = new SentEmail(messageId, region, source, toAddresses, ccAddresses,
+                bccAddresses, replyToAddresses, subject, bodyText, bodyHtml);
         emailStore.put("email::" + region + "::" + messageId, email);
 
         LOG.infov("SES email sent: from={0}, to={1}, subject={2}, messageId={3}",
@@ -116,10 +134,16 @@ public class SesService {
     }
 
     public String sendRawEmail(String source, List<String> destinations, String rawMessage, String region) {
+        if (source == null || source.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "Source email is required.", 400);
+        }
+        if (rawMessage == null || rawMessage.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "RawMessage.Data is required.", 400);
+        }
         String messageId = UUID.randomUUID().toString();
-        SentEmail email = new SentEmail(messageId, source,
+        SentEmail email = new SentEmail(messageId, region, source,
                 destinations != null ? destinations : Collections.emptyList(),
-                null, null, "(raw)", rawMessage);
+                rawMessage);
         emailStore.put("email::" + region + "::" + messageId, email);
 
         LOG.infov("SES raw email sent: from={0}, messageId={1}", source, messageId);
@@ -150,6 +174,31 @@ public class SesService {
         return identityStore.get(key).orElse(null);
     }
 
+    public void setDkimAttributes(String identityValue, boolean signingEnabled, String region) {
+        String key = identityKey(region, identityValue);
+        Identity identity = identityStore.get(key)
+                .orElseThrow(() -> new AwsException("NotFoundException",
+                        "Identity does not exist: " + identityValue, 404));
+        identity.setDkimEnabled(signingEnabled);
+        if (signingEnabled) {
+            identity.setDkimVerificationStatus("Success");
+        } else {
+            identity.setDkimVerificationStatus("NotStarted");
+        }
+        identityStore.put(key, identity);
+        LOG.infov("Updated DKIM attributes for {0}: signingEnabled={1}", identityValue, signingEnabled);
+    }
+
+    public void setFeedbackForwardingEnabled(String identityValue, boolean enabled, String region) {
+        String key = identityKey(region, identityValue);
+        Identity identity = identityStore.get(key)
+                .orElseThrow(() -> new AwsException("NotFoundException",
+                        "Identity does not exist: " + identityValue, 404));
+        identity.setFeedbackForwardingEnabled(enabled);
+        identityStore.put(key, identity);
+        LOG.infov("Updated feedback forwarding for {0}: enabled={1}", identityValue, enabled);
+    }
+
     public List<String> getVerifiedEmailAddresses(String region) {
         String prefix = "identity::" + region + "::";
         List<Identity> all = identityStore.scan(k -> k.startsWith(prefix));
@@ -163,21 +212,35 @@ public class SesService {
         return emails;
     }
 
-    public List<SentEmail> getEmails(String region) {
-        String prefix = "email::" + region + "::";
-        return emailStore.scan(k -> k.startsWith(prefix));
+    public List<SentEmail> getEmails() {
+        return emailStore.scan(k -> k.startsWith("email::"));
     }
 
-    public void clearEmails(String region) {
-        String prefix = "email::" + region + "::";
-        List<String> keys = new ArrayList<>(emailStore.keys().stream()
-                .filter(k -> k.startsWith(prefix))
-                .toList());
-        keys.forEach(emailStore::delete);
-        LOG.infov("Cleared all SES emails in region {0}", region);
+    public void clearEmails() {
+        emailStore.clear();
+        LOG.info("Cleared all SES emails");
+    }
+
+    public boolean isAccountSendingEnabled(String region) {
+        return accountSettingsStore.get("sending::" + region).orElse(true);
+    }
+
+    public void setAccountSendingEnabled(String region, boolean enabled) {
+        accountSettingsStore.put("sending::" + region, enabled);
+        LOG.infov("Updated account sending enabled for region {0}: {1}", region, enabled);
     }
 
     private static String identityKey(String region, String identity) {
+        validateIdentityWhitespace(identity, "Identity");
         return "identity::" + region + "::" + identity;
+    }
+
+    private static void validateIdentityWhitespace(String identity, String fieldName) {
+        if (identity == null || identity.isBlank()) {
+            return;
+        }
+        if (Character.isWhitespace(identity.charAt(0)) || Character.isWhitespace(identity.charAt(identity.length() - 1))) {
+            throw new AwsException("InvalidParameterValue", fieldName + " must not contain leading or trailing whitespace.", 400);
+        }
     }
 }

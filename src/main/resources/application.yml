@@ -1,7 +1,13 @@
 quarkus:
   http:
-    port: 4566
+    port: ${floci.port}
     host: 0.0.0.0
+    limits:
+      max-body-size: ${floci.max-request-size}M
+  shutdown:
+    # Enables the pre-shutdown phase so stop hooks run before the HTTP server stops.
+    # No 'delay' value is set - observers run synchronously, no artificial sleep is introduced.
+    delay-enabled: true
   native:
     additional-build-args: >-
       --initialize-at-run-time=org.apache.hc.client5.http.impl.auth.NTLMEngineImpl,
@@ -10,10 +16,14 @@ quarkus:
       --initialize-at-run-time=org.bouncycastle.jcajce.provider.drbg.DRBG$NonceAndIV,
       --initialize-at-run-time=org.bouncycastle.crypto.prng.SP800SecureRandom,
       --initialize-at-run-time=org.bouncycastle.jce.provider.BouncyCastleProvider,
+      --initialize-at-run-time=io.github.hectorvent.floci.core.common.BouncyCastleInitializer,
       --initialize-at-run-time=io.github.hectorvent.floci.services.acm.AcmService,
-      --initialize-at-run-time=io.github.hectorvent.floci.services.acm.CertificateGenerator
+      --initialize-at-run-time=io.github.hectorvent.floci.services.acm.CertificateGenerator,
+      --initialize-at-run-time=io.github.hectorvent.floci.services.cognito.CognitoSrpHelper
 
 floci:
+  port: 4566
+  max-request-size: 512
   base-url: "http://localhost:4566"
   # hostname: ""  # When set, overrides the hostname in response URLs (e.g. SQS QueueUrl).
                    # Needed for multi-container Docker setups. Example: FLOCI_HOSTNAME=floci
@@ -23,41 +33,36 @@ floci:
     # Supported modes: memory, persistent, hybrid, wal
     mode: memory
     persistent-path: ./data
+    host-persistent-path: ./data
     wal:
       compaction-interval-ms: 30000
     services:
       ssm:
-        mode: memory
         flush-interval-ms: 5000
-      sqs:
-        mode: memory
-      s3:
-        mode: memory
       dynamodb:
-        mode: memory
         flush-interval-ms: 5000
       sns:
-        mode: memory
         flush-interval-ms: 5000
       lambda:
-        mode: memory
         flush-interval-ms: 5000
       cloudwatchlogs:
-        mode: memory
         flush-interval-ms: 5000
       cloudwatchmetrics:
-        mode: memory
         flush-interval-ms: 5000
       secretsmanager:
-        mode: memory
         flush-interval-ms: 5000
       acm:
-        mode: memory
+        flush-interval-ms: 5000
+      opensearch:
         flush-interval-ms: 5000
 
   auth:
     validate-signatures: false
     presign-secret: local-emulator-secret
+
+  docker:
+    log-max-size: "10m"
+    log-max-file: "3"
 
   services:
     ssm:
@@ -85,10 +90,19 @@ floci:
       code-path: ./data/lambda-code
       poll-interval-ms: 1000
       container-idle-timeout-seconds: 300
+      region-concurrency-limit: 1000
+      unreserved-concurrency-min: 100
     apigateway:
+      enabled: true
+    apigatewayv2:
       enabled: true
     iam:
       enabled: true
+      enforcement-enabled: false
+    msk:
+      enabled: true
+      mock: false
+      default-image: "redpandadata/redpanda:latest"
     elasticache:
       enabled: true
       proxy-base-port: 6379
@@ -103,6 +117,8 @@ floci:
       default-mariadb-image: "mariadb:11"
     eventbridge:
       enabled: true
+    scheduler:
+      enabled: true
     cloudwatchlogs:
       enabled: true
       max-events-per-query: 10000
@@ -112,6 +128,8 @@ floci:
       enabled: true
       default-recovery-window-days: 30
     kinesis:
+      enabled: true
+    firehose:
       enabled: true
     kms:
       enabled: true
@@ -124,5 +142,46 @@ floci:
     acm:
       enabled: true
       validation-wait-seconds: 0
+    athena:
+      enabled: true
+    glue:
+      enabled: true
     ses:
       enabled: true
+    opensearch:
+      enabled: true
+      mock: false
+      default-image: "opensearchproject/opensearch:2"
+      proxy-base-port: 9400
+      proxy-max-port: 9499
+      keep-running-on-shutdown: false
+    ec2:
+      enabled: true
+    ecs:
+      enabled: true
+      mock: false
+    appconfig:
+      enabled: true
+    appconfigdata:
+      enabled: true
+    ecr:
+      enabled: true
+      registry-image: "registry:2"
+      registry-container-name: floci-ecr-registry
+      registry-base-port: 5100
+      registry-max-port: 5199
+      data-path: ./data/ecr
+      tls-enabled: false
+      keep-running-on-shutdown: true
+      uri-style: hostname
+    bedrock-runtime:
+      enabled: true
+    eks:
+      enabled: true
+      mock: false
+      provider: k3s
+      default-image: "rancher/k3s:latest"
+      api-server-base-port: 6500
+      api-server-max-port: 6599
+      data-path: ./data/eks
+      keep-running-on-shutdown: false

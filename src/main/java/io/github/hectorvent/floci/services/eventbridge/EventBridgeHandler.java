@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsJson11Controller;
 import io.github.hectorvent.floci.services.eventbridge.model.EventBus;
 import io.github.hectorvent.floci.services.eventbridge.model.Rule;
 import io.github.hectorvent.floci.services.eventbridge.model.RuleState;
+import io.github.hectorvent.floci.services.eventbridge.model.InputTransformer;
 import io.github.hectorvent.floci.services.eventbridge.model.Target;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -57,6 +58,11 @@ public class EventBridgeHandler {
                 case "RemoveTargets" -> handleRemoveTargets(request, region);
                 case "ListTargetsByRule" -> handleListTargetsByRule(request, region);
                 case "PutEvents" -> handlePutEvents(request, region);
+                case "ListTagsForResource" -> handleListTagsForResource(request, region);
+                case "TagResource" -> handleTagResource(request, region);
+                case "UntagResource" -> handleUntagResource(request, region);
+                case "PutPermission" -> handlePutPermission(request, region);
+                case "RemovePermission" -> handleRemovePermission(request, region);
                 default -> Response.status(400)
                         .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported."))
                         .build();
@@ -177,6 +183,16 @@ public class EventBridgeHandler {
                         input.isEmpty() ? null : input,
                         inputPath.isEmpty() ? null : inputPath
                 );
+                JsonNode transformerNode = t.path("InputTransformer");
+                if (!transformerNode.isMissingNode() && transformerNode.isObject()) {
+                    Map<String, String> pathsMap = new HashMap<>();
+                    JsonNode pathsNode = transformerNode.path("InputPathsMap");
+                    if (pathsNode.isObject()) {
+                        pathsNode.fields().forEachRemaining(e -> pathsMap.put(e.getKey(), e.getValue().asText()));
+                    }
+                    String template = transformerNode.path("InputTemplate").asText(null);
+                    target.setInputTransformer(new InputTransformer(pathsMap, template));
+                }
                 targets.add(target);
             }
         }
@@ -223,6 +239,14 @@ public class EventBridgeHandler {
             if (t.getInputPath() != null) {
                 node.put("InputPath", t.getInputPath());
             }
+            if (t.getInputTransformer() != null) {
+                ObjectNode transformerNode = node.putObject("InputTransformer");
+                ObjectNode pathsNode = transformerNode.putObject("InputPathsMap");
+                t.getInputTransformer().getInputPathsMap().forEach(pathsNode::put);
+                if (t.getInputTransformer().getInputTemplate() != null) {
+                    transformerNode.put("InputTemplate", t.getInputTransformer().getInputTemplate());
+                }
+            }
             targetsArray.add(node);
         }
         return Response.ok(response).build();
@@ -246,6 +270,9 @@ public class EventBridgeHandler {
                 if (!entryNode.path("Detail").isMissingNode()) {
                     entry.put("Detail", entryNode.path("Detail").asText(null));
                 }
+                if (!entryNode.path("Resources").isMissingNode()) {
+                    entry.put("Resources", entryNode.path("Resources"));
+                }
                 entries.add(entry);
             }
         }
@@ -261,6 +288,66 @@ public class EventBridgeHandler {
         return Response.ok(response).build();
     }
 
+    private Response handleListTagsForResource(JsonNode request, String region) {
+        String resourceArn = request.path("ResourceARN").asText(null);
+        if (resourceArn == null || resourceArn.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "ResourceARN is required.", 400);
+        }
+        Map<String, String> tags = eventBridgeService.listTagsForResource(resourceArn, region);
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode tagsArray = response.putArray("Tags");
+        tags.forEach((key, value) -> {
+            ObjectNode tagNode = objectMapper.createObjectNode();
+            tagNode.put("Key", key);
+            tagNode.put("Value", value);
+            tagsArray.add(tagNode);
+        });
+        return Response.ok(response).build();
+    }
+
+    private Response handleTagResource(JsonNode request, String region) {
+        String resourceArn = request.path("ResourceARN").asText(null);
+        if (resourceArn == null || resourceArn.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "ResourceARN is required.", 400);
+        }
+        Map<String, String> tags = parseTagsArray(request.path("Tags"));
+        eventBridgeService.tagResource(resourceArn, tags, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleUntagResource(JsonNode request, String region) {
+        String resourceArn = request.path("ResourceARN").asText(null);
+        if (resourceArn == null || resourceArn.isBlank()) {
+            throw new AwsException("InvalidParameterValue", "ResourceARN is required.", 400);
+        }
+        List<String> tagKeys = new ArrayList<>();
+        request.path("TagKeys").forEach(k -> tagKeys.add(k.asText()));
+        eventBridgeService.untagResource(resourceArn, tagKeys, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handlePutPermission(JsonNode request, String region) {
+        String busName = request.path("EventBusName").asText(null);
+        String action = request.path("Action").asText(null);
+        String principal = request.path("Principal").asText(null);
+        String statementId = request.path("StatementId").asText(null);
+        String policy = request.path("Policy").asText(null);
+        JsonNode conditionNode = request.path("Condition");
+        String conditionJson = conditionNode.isMissingNode() || conditionNode.isNull()
+                ? null : conditionNode.toString();
+        eventBridgeService.putPermission(busName, action, principal, statementId,
+                conditionJson, policy, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleRemovePermission(JsonNode request, String region) {
+        String busName = request.path("EventBusName").asText(null);
+        String statementId = request.path("StatementId").asText(null);
+        boolean removeAll = request.path("RemoveAllPermissions").asBoolean(false);
+        eventBridgeService.removePermission(busName, statementId, removeAll, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
     // ──────────────────────────── Helpers ────────────────────────────
 
     private ObjectNode buildBusNode(EventBus bus) {
@@ -272,6 +359,9 @@ public class EventBridgeHandler {
         }
         if (bus.getCreatedTime() != null) {
             node.put("CreationTime", bus.getCreatedTime().getEpochSecond());
+        }
+        if (bus.getPolicy() != null) {
+            node.put("Policy", bus.getPolicy());
         }
         return node;
     }

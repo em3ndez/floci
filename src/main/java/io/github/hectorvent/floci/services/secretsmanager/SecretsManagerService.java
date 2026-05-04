@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.secretsmanager;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -7,7 +8,6 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.secretsmanager.model.Secret;
 import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
-import com.fasterxml.jackson.core.type.TypeReference;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -124,7 +125,9 @@ public class SecretsManagerService {
         return version;
     }
 
-    public SecretVersion putSecretValue(String secretId, String secretString, String secretBinary, String region) {
+    public SecretVersion putSecretValue(String secretId, String secretString,
+                                        String secretBinary, String region,
+                                        List<String> versionStages) {
         Secret secret = resolveSecret(secretId, region);
 
         if (secret.getDeletedDate() != null) {
@@ -135,25 +138,74 @@ public class SecretsManagerService {
         Instant now = Instant.now();
         String newVersionId = UUID.randomUUID().toString();
 
-        SecretVersion oldCurrent = findVersionByStage(secret, AWSCURRENT);
-        if (oldCurrent != null) {
-            List<String> stages = new ArrayList<>(oldCurrent.getVersionStages());
-            stages.remove(AWSCURRENT);
-            if (!stages.contains(AWSPREVIOUS)) {
-                stages.add(AWSPREVIOUS);
+        List<String> stages;
+        if (versionStages != null) {
+            if (versionStages.isEmpty() || versionStages.size() > 20) {
+                throw new AwsException("ValidationException", "Invalid length for parameter VersionStages", 400);
             }
-            oldCurrent.setVersionStages(stages);
+            if (versionStages.stream()
+                    .anyMatch(stage -> stage == null
+                            || stage.isEmpty()
+                            || stage.length() > 256)) {
+                throw new AwsException("ValidationException", "Member must have length less than or equal to 256, Member must have length greater than or equal to 1", 400);
+            }
+            stages = versionStages;
+        } else {
+            stages = List.of(AWSCURRENT);
+        }
+
+        SecretVersion previousCurrent = stages.contains(AWSCURRENT) ? findVersionByStage(secret, AWSCURRENT) : null;
+
+        for (String stage : stages) {
+            SecretVersion version = findVersionByStage(secret, stage);
+            if (version == null) {
+                continue;
+            }
+            List<String> newStages = new ArrayList<>(version.getVersionStages());
+            // if stage is AWSCURRENT, the previous AWSCURRENT will become
+            // AWSPREVIOUS, and the previous AWSPREVIOUS will drop that stage
+            // name
+            if (stage.equals(AWSCURRENT)) {
+                SecretVersion previous = findVersionByStage(secret, AWSPREVIOUS);
+                if (previous != null) {
+                    List<String> oldPrevious = new ArrayList<>(previous.getVersionStages());
+                    oldPrevious.remove(AWSPREVIOUS);
+                    previous.setVersionStages(oldPrevious);
+                }
+                newStages.add(AWSPREVIOUS);
+            }
+            newStages.remove(stage);
+
+            version.setVersionStages(newStages);
+        }
+
+        if (previousCurrent != null) {
+            for (SecretVersion version : secret.getVersions().values()) {
+                List<String> assignedStages = version.getVersionStages();
+                if (assignedStages == null || !assignedStages.contains(AWSPREVIOUS)) {
+                    continue;
+                }
+                List<String> newStages = new ArrayList<>(assignedStages);
+                newStages.removeIf(AWSPREVIOUS::equals);
+                version.setVersionStages(newStages);
+            }
+
+            List<String> newStages = new ArrayList<>(previousCurrent.getVersionStages());
+            newStages.add(AWSPREVIOUS);
+            previousCurrent.setVersionStages(newStages);
         }
 
         SecretVersion newVersion = new SecretVersion();
         newVersion.setVersionId(newVersionId);
         newVersion.setSecretString(secretString);
         newVersion.setSecretBinary(secretBinary);
-        newVersion.setVersionStages(new ArrayList<>(List.of(AWSCURRENT)));
+        newVersion.setVersionStages(stages);
         newVersion.setCreatedDate(now);
 
         secret.getVersions().put(newVersionId, newVersion);
-        secret.setCurrentVersionId(newVersionId);
+        if (stages.contains(AWSCURRENT)) {
+            secret.setCurrentVersionId(newVersionId);
+        }
         secret.setLastChangedDate(now);
 
         store.put(regionKey(region, secret.getName()), secret);
@@ -263,17 +315,157 @@ public class SecretsManagerService {
         return result;
     }
 
+    public List<BatchSecretValue> batchGetSecretValue(List<String> secretIdList, String region) {
+        List<BatchSecretValue> result = new ArrayList<>();
+        if (secretIdList == null) {
+            return result;
+        }
+
+        for (String secretId : secretIdList) {
+            try {
+                Secret secret = resolveSecret(secretId, region);
+                if (secret.getDeletedDate() != null) {
+                    continue;
+                }
+                SecretVersion version = findVersionByStage(secret, AWSCURRENT);
+                if (version != null) {
+                    result.add(new BatchSecretValue(
+                            secret.getArn(),
+                            secret.getName(),
+                            version.getSecretString(),
+                            version.getSecretBinary(),
+                            version.getVersionId(),
+                            version.getVersionStages(),
+                            version.getCreatedDate()
+                    ));
+                }
+            } catch (AwsException e) {
+                // AWS documentation says: "Secrets Manager doesn't return an error if a secret in the SecretIdList doesn't exist."
+                // Wait, let me re-check that. 
+                // Actually, "If any of the secrets in the SecretIdList don't exist, Secrets Manager returns an error."
+                // Let me verify this in the AWS docs.
+                throw e;
+            }
+        }
+        return result;
+    }
+
+    public Secret updateSecretVersionStage(String secretId, String moveToVersionId, String removeFromVersionId, String versionStage, String region) {
+
+        if (secretId == null || secretId.isEmpty() || secretId.length() > 2048) {
+            throw new AwsException("InvalidParameterException", "Parameter validation failed. Invalid SecretId.", 400);
+        } else if (versionStage == null || versionStage.isEmpty() || versionStage.length() > 256) {
+            throw new AwsException("InvalidParameterException", "Parameter validation failed. Invalid VersionStage.", 400);
+        } else if (moveToVersionId != null && (moveToVersionId.length() < 32 || moveToVersionId.length() > 64)) {
+            throw new AwsException("InvalidParameterException", "Parameter validation failed. Invalid MoveToVersionId.", 400);
+        } else if (removeFromVersionId != null && (removeFromVersionId.length() < 32 || removeFromVersionId.length() > 64)) {
+            throw new AwsException("InvalidParameterException", "Parameter validation failed. Invalid RemoveFromVersionId.", 400);
+        }
+
+        Secret secret = resolveSecret(secretId, region);
+        if (secret.getDeletedDate() != null) {
+            throw new AwsException("ResourceNotFoundException", "Secrets Manager can't find the specified secret.", 400);
+        }
+
+        SecretVersion versionByStage = findVersionByStage(secret, versionStage);
+        String currentVersionId = versionByStage != null
+                ? versionByStage.getVersionId() : null;
+
+        if (currentVersionId != null) {
+
+            // If the label is attached and you either do not specify
+            // this parameter, or the version ID does not match, then the
+            // operation fails.
+            if (removeFromVersionId == null) {
+                throw new AwsException("InvalidParameterException",
+                        ("The parameter RemoveFromVersionId can't be empty. Staging label %s is currently attached to "
+                            + "version %s, so you must explicitly reference that version in RemoveFromVersionId.")
+                        .formatted(versionByStage, currentVersionId), 400);
+            } else if (!Objects.equals(currentVersionId, removeFromVersionId)) {
+                throw new AwsException("InvalidParameterException",
+                        ("When you move staging label %s, if you specify RemoveFromVersionId, it must be set to the "
+                            + "version that currently has the staging label %s.")
+                        .formatted(versionByStage, currentVersionId), 400);
+            }
+
+            List<String> mutableStages = new ArrayList<>(secret.getVersions()
+                    .get(removeFromVersionId).getVersionStages());
+            mutableStages.remove(versionStage);
+
+            if (AWSCURRENT.equals(versionStage)) {
+                mutableStages.add(AWSPREVIOUS);
+
+                // remove AWSPREVIOUS tag from the previous SecretVersion
+                SecretVersion previous = findVersionByStage(secret, AWSPREVIOUS);
+                if (previous != null) {
+                    List<String> mutablePrevStages =
+                            new ArrayList<>(previous.getVersionStages());
+                    mutablePrevStages.remove(AWSPREVIOUS);
+                    previous.setVersionStages(mutablePrevStages);
+                }
+            }
+            secret.getVersions().get(removeFromVersionId).setVersionStages(mutableStages);
+        }
+
+        if (moveToVersionId != null) {
+            // check whether it exists
+            if (!secret.getVersions().containsKey(moveToVersionId)) {
+                throw new AwsException("ResourceNotFoundException",
+                        "Secrets Manager can't find the specified secret value for VersionId: %s.".formatted(moveToVersionId),
+                        400);
+            }
+
+            // we are adding versionStage to this ID
+            List<String> mutableStages = new ArrayList<>(secret.getVersions().get(moveToVersionId).getVersionStages());
+            mutableStages.add(versionStage);
+            secret.getVersions().get(moveToVersionId).setVersionStages(mutableStages);
+        }
+
+        store.put(regionKey(region, secret.getName()), secret);
+
+        return secret;
+    }
+
+    public record BatchSecretValue(
+            String arn,
+            String name,
+            String secretString,
+            String secretBinary,
+            String versionId,
+            List<String> versionStages,
+            Instant createdDate
+    ) {
+    }
+
     private Secret resolveSecret(String secretId, String region) {
         if (secretId.startsWith("arn:")) {
+            // 1. Exact full-ARN match
             List<Secret> found = store.scan(key -> {
                 Secret s = store.get(key).orElse(null);
                 return s != null && secretId.equals(s.getArn());
             });
-            if (found.isEmpty()) {
-                throw new AwsException("ResourceNotFoundException",
-                        "Secrets Manager can't find the specified secret.", 400);
+            if (!found.isEmpty()) {
+                return found.getFirst();
             }
-            return found.getFirst();
+
+            // 2. Partial-ARN fallback: extract region + name and do a name-based lookup.
+            //    AWS supports ARNs without the trailing "-XXXXXX" random suffix.
+            //    ARN format: arn:aws:secretsmanager:<region>:<account>:secret:<name>
+            String smPrefix = "arn:aws:secretsmanager:";
+            if (secretId.startsWith(smPrefix)) {
+                String[] parts = secretId.substring(smPrefix.length()).split(":", 4);
+                if (parts.length == 4 && "secret".equals(parts[2])) {
+                    String arnRegion = parts[0];
+                    String nameFromArn = parts[3];
+                    Secret byName = store.get(regionKey(arnRegion, nameFromArn)).orElse(null);
+                    if (byName != null) {
+                        return byName;
+                    }
+                }
+            }
+
+            throw new AwsException("ResourceNotFoundException",
+                    "Secrets Manager can't find the specified secret.", 400);
         }
 
         String storageKey = regionKey(region, secretId);

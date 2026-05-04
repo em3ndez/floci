@@ -7,49 +7,49 @@ Floci can be run three ways: as a Docker image, as a pre-built native binary, or
 No installation required beyond Docker itself.
 
 ```bash
-docker pull hectorvent/floci:latest
+docker pull floci/floci:latest
 ```
-
-| Tag | Description |
-|---|---|
-| `latest` | Native image — sub-second startup, low memory (**default**) |
-| `x.y.z` | Native image — specific release version |
-| `latest-jvm` | JVM image — most compatible |
-| `x.y.z-jvm` | JVM image — specific release version |
 
 ### Requirements
 
 - Docker 20.10+
 - `docker compose` v2+ (plugin syntax, not standalone `docker-compose`)
 
-## Native vs JVM
+## Image Tags
 
-The `latest` tag is the native image — a self-contained executable with no JVM dependency.
+Each tag combines a **variant** (what's inside) and a **channel** (how stable).
+
+|  | Standard | Compat (+ AWS CLI + boto3) |
+|---|---|---|
+| **Release (latest)** | `latest` ✅ | `latest-compat` |
+| **Release (pinned)** | `x.y.z` | `x.y.z-compat` |
+| **Nightly (floating)** | `nightly` | `nightly-compat` |
+| **Nightly (dated)** | `nightly-mmddyyyy` | `nightly-mmddyyyy-compat` |
+
+For the full breakdown see [Docker Images](../configuration/docker-images.md).
+
+## Choosing a tag
 
 ```yaml title="docker-compose.yml"
+# Standard release — recommended for most use cases
 services:
   floci:
-    image: hectorvent/floci:latest   # native — recommended
+    image: floci/floci:latest
     ports:
       - "4566:4566"
 ```
 
-Use the JVM image if you need broader platform compatibility or encounter native image issues:
+Use the compat image if your workflow requires the AWS CLI or boto3 available inside the container:
 
 ```yaml title="docker-compose.yml"
 services:
   floci:
-    image: hectorvent/floci:latest-jvm
+    image: floci/floci:latest-compat
     ports:
       - "4566:4566"
 ```
 
-### Startup comparison
-
-| Image | Tag | Typical startup | Idle memory |
-|---|---|---|---|
-| Native | `latest` / `x.y.z` | < 100 ms | ~50 MB |
-| JVM | `latest-jvm` / `x.y.z-jvm` | ~2 s | ~250 MB |
+Both variants have identical startup time (~24 ms) and memory footprint (~13 MiB).
 
 ## Build from Source
 
@@ -62,7 +62,7 @@ services:
 ### Clone and run
 
 ```bash
-git clone https://github.com/hectorvent/floci.git
+git clone https://github.com/floci-io/floci.git
 cd floci
 mvn quarkus:dev          # dev mode with hot reload on port 4566
 ```

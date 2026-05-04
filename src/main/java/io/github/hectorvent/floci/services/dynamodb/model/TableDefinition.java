@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.dynamodb.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -32,9 +33,13 @@ public class TableDefinition {
     private String billingMode; // "PROVISIONED" or "PAY_PER_REQUEST"
     private String ttlAttributeName;
     private boolean ttlEnabled;
+    private boolean pointInTimeRecoveryEnabled;
+    private int pointInTimeRecoveryRecoveryPeriodInDays;
+    private boolean deletionProtectionEnabled;
     private boolean streamEnabled;
     private String streamArn;
     private String streamViewType;
+    private List<KinesisStreamingDestination> kinesisStreamingDestinations;
 
     public TableDefinition() {
         this.keySchema = new ArrayList<>();
@@ -42,6 +47,8 @@ public class TableDefinition {
         this.tags = new HashMap<>();
         this.globalSecondaryIndexes = new ArrayList<>();
         this.localSecondaryIndexes = new ArrayList<>();
+        this.pointInTimeRecoveryRecoveryPeriodInDays = 35;
+        this.kinesisStreamingDestinations = new ArrayList<>();
     }
 
     public TableDefinition(String tableName,
@@ -61,11 +68,13 @@ public class TableDefinition {
         this.creationDateTime = Instant.now();
         this.itemCount = 0;
         this.tableSizeBytes = 0;
-        this.tableArn = "arn:aws:dynamodb:" + region + ":" + accountId + ":table/" + tableName;
+        this.tableArn = AwsArnUtils.Arn.of("dynamodb", region, accountId, "table/" + tableName).toString();
         this.provisionedThroughput = new ProvisionedThroughput(5, 5);
         this.tags = new HashMap<>();
         this.globalSecondaryIndexes = new ArrayList<>();
         this.localSecondaryIndexes = new ArrayList<>();
+        this.pointInTimeRecoveryRecoveryPeriodInDays = 35;
+        this.kinesisStreamingDestinations = new ArrayList<>();
     }
 
     public String getTableName() { return tableName; }
@@ -117,6 +126,19 @@ public class TableDefinition {
     public boolean isTtlEnabled() { return ttlEnabled; }
     public void setTtlEnabled(boolean ttlEnabled) { this.ttlEnabled = ttlEnabled; }
 
+    public boolean isPointInTimeRecoveryEnabled() { return pointInTimeRecoveryEnabled; }
+    public void setPointInTimeRecoveryEnabled(boolean pointInTimeRecoveryEnabled) {
+        this.pointInTimeRecoveryEnabled = pointInTimeRecoveryEnabled;
+    }
+
+    public int getPointInTimeRecoveryRecoveryPeriodInDays() { return pointInTimeRecoveryRecoveryPeriodInDays; }
+    public void setPointInTimeRecoveryRecoveryPeriodInDays(int pointInTimeRecoveryRecoveryPeriodInDays) {
+        this.pointInTimeRecoveryRecoveryPeriodInDays = pointInTimeRecoveryRecoveryPeriodInDays;
+    }
+
+    public boolean isDeletionProtectionEnabled() { return deletionProtectionEnabled; }
+    public void setDeletionProtectionEnabled(boolean deletionProtectionEnabled) { this.deletionProtectionEnabled = deletionProtectionEnabled; }
+
     public boolean isStreamEnabled() { return streamEnabled; }
     public void setStreamEnabled(boolean streamEnabled) { this.streamEnabled = streamEnabled; }
 
@@ -125,6 +147,19 @@ public class TableDefinition {
 
     public String getStreamViewType() { return streamViewType; }
     public void setStreamViewType(String streamViewType) { this.streamViewType = streamViewType; }
+
+    public List<KinesisStreamingDestination> getKinesisStreamingDestinations() {
+        return kinesisStreamingDestinations != null ? kinesisStreamingDestinations : new ArrayList<>();
+    }
+    public void setKinesisStreamingDestinations(List<KinesisStreamingDestination> destinations) {
+        this.kinesisStreamingDestinations = destinations != null ? destinations : new ArrayList<>();
+    }
+
+    public Optional<KinesisStreamingDestination> findKinesisStreamingDestination(String streamArn) {
+        return getKinesisStreamingDestinations().stream()
+                .filter(d -> streamArn.equals(d.getStreamArn()))
+                .findFirst();
+    }
 
     /** Returns the partition key attribute name. */
     public String getPartitionKeyName() {

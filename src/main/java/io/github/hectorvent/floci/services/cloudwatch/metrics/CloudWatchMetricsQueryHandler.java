@@ -15,7 +15,9 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 @ApplicationScoped
 public class CloudWatchMetricsQueryHandler {
@@ -30,18 +32,21 @@ public class CloudWatchMetricsQueryHandler {
     }
 
     public Response handle(String action, MultivaluedMap<String, String> params, String region) {
-        LOG.debugv("CloudWatch Metrics action: {0}", action);
-        return switch (action) {
+        String normalizedAction = action.substring(0, 1).toUpperCase() + action.substring(1);
+        return switch (normalizedAction) {
             case "PutMetricData" -> handlePutMetricData(params, region);
             case "ListMetrics" -> handleListMetrics(params, region);
             case "GetMetricStatistics" -> handleGetMetricStatistics(params, region);
-            case "GetMetricData" -> handleGetMetricDataStub(params);
+            case "GetMetricData" -> handleGetMetricData(params, region);
             case "PutMetricAlarm" -> handlePutMetricAlarm(params, region);
             case "DescribeAlarms" -> handleDescribeAlarms(params, region);
             case "DeleteAlarms" -> handleDeleteAlarms(params, region);
             case "SetAlarmState" -> handleSetAlarmState(params, region);
+            case "ListTagsForResource" -> handleListTagsForResource(params, region);
+            case "TagResource" -> handleTagResource(params, region);
+            case "UntagResource" -> handleUntagResource(params, region);
             default -> AwsQueryResponse.error("UnsupportedOperation",
-                    "Operation " + action + " is not supported by CloudWatch.", AwsNamespaces.CW, 400);
+                    "Operation " + action + " is not supported by CloudWatch Query.", AwsNamespaces.CW, 400);
         };
     }
 
@@ -128,9 +133,79 @@ public class CloudWatchMetricsQueryHandler {
         return Response.ok(AwsQueryResponse.envelope("GetMetricStatistics", null, xml.build())).build();
     }
 
-    private Response handleGetMetricDataStub(MultivaluedMap<String, String> params) {
-        String result = new XmlBuilder().start("MetricDataResults").end("MetricDataResults").build();
-        return Response.ok(AwsQueryResponse.envelope("GetMetricData", null, result)).build();
+    private Response handleGetMetricData(MultivaluedMap<String, String> params, String region) {
+        Instant startTime = parseInstant(params.getFirst("StartTime"));
+        Instant endTime = parseInstant(params.getFirst("EndTime"));
+
+        List<CloudWatchMetricsService.MetricDataQuery> queries = parseMetricDataQueries(params);
+
+        List<CloudWatchMetricsService.MetricDataResult> results =
+                metricsService.getMetricData(queries, startTime, endTime, region);
+
+        DateTimeFormatter fmt = DateTimeFormatter.ISO_INSTANT;
+        var xml = new XmlBuilder().start("MetricDataResults");
+        for (var r : results) {
+            xml.start("member")
+                    .elem("Id", r.id())
+                    .elem("Label", r.label())
+                    .elem("StatusCode", r.statusCode());
+
+            xml.start("Timestamps");
+            for (Instant ts : r.timestamps()) {
+                xml.elem("member", fmt.format(ts));
+            }
+            xml.end("Timestamps");
+
+            xml.start("Values");
+            for (Double v : r.values()) {
+                xml.elem("member", String.valueOf(v));
+            }
+            xml.end("Values");
+
+            xml.end("member");
+        }
+        xml.end("MetricDataResults");
+        return Response.ok(AwsQueryResponse.envelope("GetMetricData", null, xml.build())).build();
+    }
+
+    private List<CloudWatchMetricsService.MetricDataQuery> parseMetricDataQueries(
+            MultivaluedMap<String, String> params) {
+        List<CloudWatchMetricsService.MetricDataQuery> queries = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String prefix = "MetricDataQueries.member." + i;
+            String id = params.getFirst(prefix + ".Id");
+            if (id == null) break;
+
+            String expression = params.getFirst(prefix + ".Expression");
+            String label = params.getFirst(prefix + ".Label");
+            boolean returnData = !"false".equals(params.getFirst(prefix + ".ReturnData"));
+
+            CloudWatchMetricsService.MetricStat metricStat = null;
+            String msNamespace = params.getFirst(prefix + ".MetricStat.Metric.Namespace");
+            if (msNamespace != null) {
+                String msMetricName = params.getFirst(prefix + ".MetricStat.Metric.MetricName");
+                int msPeriod = parseIntParam(params, prefix + ".MetricStat.Period", 60);
+                String msStat = params.getFirst(prefix + ".MetricStat.Stat");
+                String msUnit = params.getFirst(prefix + ".MetricStat.Unit");
+
+                List<Dimension> dims = new ArrayList<>();
+                for (int j = 1; ; j++) {
+                    String dimName = params.getFirst(
+                            prefix + ".MetricStat.Metric.Dimensions.member." + j + ".Name");
+                    if (dimName == null) break;
+                    String dimValue = params.getFirst(
+                            prefix + ".MetricStat.Metric.Dimensions.member." + j + ".Value");
+                    dims.add(new Dimension(dimName, dimValue));
+                }
+
+                metricStat = new CloudWatchMetricsService.MetricStat(
+                        msNamespace, msMetricName, dims, msPeriod, msStat, msUnit);
+            }
+
+            queries.add(new CloudWatchMetricsService.MetricDataQuery(
+                    id, metricStat, expression, label, returnData));
+        }
+        return queries;
     }
 
     private Response handlePutMetricAlarm(MultivaluedMap<String, String> params, String region) {
@@ -176,6 +251,39 @@ public class CloudWatchMetricsQueryHandler {
         String reasonData = params.getFirst("StateReasonData");
         metricsService.setAlarmState(name, state, reason, reasonData, region);
         return Response.ok(AwsQueryResponse.envelopeNoResult("SetAlarmState", null)).build();
+    }
+
+    private Response handleListTagsForResource(MultivaluedMap<String, String> params, String region) {
+        String arn = params.getFirst("ResourceARN");
+        Map<String, String> tags = metricsService.listTagsForResource(arn, region);
+        XmlBuilder xml = new XmlBuilder().start("Tags");
+        tags.forEach((k, v) -> xml.start("member").elem("Key", k).elem("Value", v).end("member"));
+        xml.end("Tags");
+        return Response.ok(AwsQueryResponse.envelope("ListTagsForResource", null, xml.build())).build();
+    }
+
+    private Response handleTagResource(MultivaluedMap<String, String> params, String region) {
+        String arn = params.getFirst("ResourceARN");
+        Map<String, String> tags = new LinkedHashMap<>();
+        for (int i = 1; ; i++) {
+            String key = params.getFirst("Tags.member." + i + ".Key");
+            if (key == null) break;
+            tags.put(key, params.getFirst("Tags.member." + i + ".Value"));
+        }
+        metricsService.tagResource(arn, tags, region);
+        return Response.ok(AwsQueryResponse.envelopeNoResult("TagResource", null)).build();
+    }
+
+    private Response handleUntagResource(MultivaluedMap<String, String> params, String region) {
+        String arn = params.getFirst("ResourceARN");
+        List<String> keys = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String key = params.getFirst("TagKeys.member." + i);
+            if (key == null) break;
+            keys.add(key);
+        }
+        metricsService.untagResource(arn, keys, region);
+        return Response.ok(AwsQueryResponse.envelopeNoResult("UntagResource", null)).build();
     }
 
     // ──────────────────────────── Parsing Helpers ────────────────────────────
@@ -283,6 +391,15 @@ public class CloudWatchMetricsQueryHandler {
             if (act == null) break;
             a.getInsufficientDataActions().add(act);
         }
+
+        // Tags
+        Map<String, String> tags = new LinkedHashMap<>();
+        for (int i = 1; ; i++) {
+            String key = params.getFirst("Tags.member." + i + ".Key");
+            if (key == null) break;
+            tags.put(key, params.getFirst("Tags.member." + i + ".Value"));
+        }
+        a.setTags(tags);
 
         return a;
     }

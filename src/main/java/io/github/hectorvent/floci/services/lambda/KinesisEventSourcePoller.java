@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.services.lambda;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisRecord;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisShard;
@@ -12,7 +14,6 @@ import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.vertx.core.Vertx;
-import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -60,8 +61,7 @@ public class KinesisEventSourcePoller {
         this.objectMapper = objectMapper;
     }
 
-    @PostConstruct
-    void init() {
+    public void startPersistedPollers() {
         List<EventSourceMapping> esms = esmStore.list();
         for (EventSourceMapping esm : esms) {
             if (esm.isEnabled() && esm.getEventSourceArn().contains(":kinesis:")) {
@@ -118,8 +118,18 @@ public class KinesisEventSourcePoller {
 
                     if (!records.isEmpty()) {
                         String eventJson = buildKinesisEvent(records, esm, shard.getShardId());
-                        InvokeResult invokeResult = executorService.invoke(fn, eventJson.getBytes(), InvocationType.RequestResponse);
-                        
+                        InvokeResult invokeResult;
+                        try {
+                            invokeResult = executorService.invoke(fn, eventJson.getBytes(), InvocationType.RequestResponse);
+                        } catch (AwsException e) {
+                            if ("TooManyRequestsException".equals(e.getErrorCode())) {
+                                LOG.infov("Kinesis ESM {0}: function {1} throttled, shard iterator not advanced",
+                                        esm.getUuid(), fn.getFunctionName());
+                                continue;
+                            }
+                            throw e;
+                        }
+
                         if (invokeResult.getFunctionError() == null) {
                             String newestSeq = records.get(records.size() - 1).getSequenceNumber();
                             esm.getShardSequenceNumbers().put(shard.getShardId(), newestSeq);
@@ -152,7 +162,7 @@ public class KinesisEventSourcePoller {
                 record.put("eventVersion", "1.0");
                 record.put("eventID", shardId + ":" + rec.getSequenceNumber());
                 record.put("eventName", "aws:kinesis:record");
-                record.put("invokeIdentityArn", "arn:aws:iam::000000000000:role/lambda-role");
+                record.put("invokeIdentityArn", AwsArnUtils.Arn.of("iam", "", "000000000000", "role/lambda-role").toString());
                 record.put("awsRegion", esm.getRegion());
                 record.put("eventSourceARN", esm.getEventSourceArn());
                 recordsArray.add(record);

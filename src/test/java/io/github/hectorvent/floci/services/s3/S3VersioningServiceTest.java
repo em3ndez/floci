@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 
@@ -22,7 +23,7 @@ class S3VersioningServiceTest {
 
     @BeforeEach
     void setUp() {
-        s3Service = new S3Service(new InMemoryStorage<>(), new InMemoryStorage<>(), tempDir);
+        s3Service = new S3Service(new InMemoryStorage<>(), new InMemoryStorage<>(), tempDir, true);
         s3Service.createBucket("versioned-bucket", "us-east-1");
     }
 
@@ -139,8 +140,9 @@ class S3VersioningServiceTest {
         s3Service.putObject("versioned-bucket", "test.txt",
                 "v2".getBytes(StandardCharsets.UTF_8), "text/plain", null);
 
-        List<S3Object> versions = s3Service.listObjectVersions("versioned-bucket", null, 100);
-        assertEquals(2, versions.size());
+        S3Service.ListVersionsResult result = s3Service.listObjectVersions("versioned-bucket", null, 100, null);
+        assertEquals(2, result.versions().size());
+        assertFalse(result.isTruncated());
     }
 
     @Test
@@ -150,9 +152,9 @@ class S3VersioningServiceTest {
                 "data".getBytes(StandardCharsets.UTF_8), "text/plain", null);
         s3Service.deleteObject("versioned-bucket", "test.txt");
 
-        List<S3Object> versions = s3Service.listObjectVersions("versioned-bucket", null, 100);
-        assertEquals(2, versions.size());
-        assertTrue(versions.stream().anyMatch(S3Object::isDeleteMarker));
+        S3Service.ListVersionsResult result = s3Service.listObjectVersions("versioned-bucket", null, 100, null);
+        assertEquals(2, result.versions().size());
+        assertTrue(result.versions().stream().anyMatch(S3Object::isDeleteMarker));
     }
 
     @Test
@@ -164,6 +166,22 @@ class S3VersioningServiceTest {
         AwsException ex = assertThrows(AwsException.class, () ->
                 s3Service.getObject("versioned-bucket", "test.txt", "fake-version-id"));
         assertEquals("NoSuchVersion", ex.getErrorCode());
+    }
+
+    @Test
+    void versionedFileUsesS3dataSuffixOnDisk() {
+        S3Service diskService = new S3Service(new InMemoryStorage<>(), new InMemoryStorage<>(), tempDir, false);
+        diskService.createBucket("versioned-bucket", "us-east-1");
+        diskService.putBucketVersioning("versioned-bucket", "Enabled");
+        S3Object v1 = diskService.putObject("versioned-bucket", "test.txt",
+                "v1".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+
+        Path versionedPath = tempDir.resolve(".versions")
+                .resolve("versioned-bucket")
+                .resolve("test.txt")
+                .resolve(v1.getVersionId() + ".s3data");
+        assertTrue(Files.exists(versionedPath),
+                "versioned file should be stored with .s3data suffix");
     }
 
     @Test

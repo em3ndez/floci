@@ -1,5 +1,6 @@
 *
 !docker/entrypoint.sh
+!docker/localstack-parity.sh
 !pom.xml
 !src/**
 !target/*.so
@@ -8,3 +9,4 @@
 !target/*-runner.jar
 !target/lib/*
 !target/quarkus-app/*
+!native/**

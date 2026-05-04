@@ -1,10 +1,12 @@
 package io.github.hectorvent.floci.services.sqs;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.github.hectorvent.floci.services.sqs.model.Queue;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -16,7 +18,6 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicLong;
 
 @ApplicationScoped
@@ -28,20 +29,25 @@ public class SqsService {
     private final StorageBackend<String, Queue> queueStore;
     private final StorageBackend<String, List<Message>> messageStore;
     private final StorageBackend<String, Map<String, Long>> dedupStore;
-    private final ConcurrentHashMap<String, ConcurrentLinkedDeque<Message>> messagesByQueue = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, GuardedMessageQueue> messagesByQueue = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> queueLocks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, RedrivePolicy> redrivePolicyCache = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, Instant>> deduplicationCache = new ConcurrentHashMap<>();
     private final AtomicLong sequenceCounter = new AtomicLong(0);
 
-    private record RedrivePolicy(int maxReceiveCount, String deadLetterTargetArn) {}
+    private record RedrivePolicy(int maxReceiveCount, String deadLetterTargetArn) {
+    }
+
     private final int defaultVisibilityTimeout;
     private final int maxMessageSize;
     private final String baseUrl;
     private final RegionResolver regionResolver;
+    private final boolean clearFifoDeduplicationCacheOnPurge;
+    private final SnsService snsService;
 
     @Inject
-    public SqsService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver) {
+    public SqsService(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver,
+                      SnsService snsService) {
         this(
                 storageFactory.create("sqs", "sqs-queues.json",
                         new TypeReference<Map<String, Queue>>() {
@@ -55,7 +61,9 @@ public class SqsService {
                 config.services().sqs().defaultVisibilityTimeout(),
                 config.services().sqs().maxMessageSize(),
                 config.effectiveBaseUrl(),
-                regionResolver
+                regionResolver,
+                config.services().sqs().clearFifoDeduplicationCacheOnPurge(),
+                snsService
         );
     }
 
@@ -65,13 +73,22 @@ public class SqsService {
     SqsService(StorageBackend<String, Queue> queueStore,
                int defaultVisibilityTimeout, int maxMessageSize, String baseUrl) {
         this(queueStore, null, null, defaultVisibilityTimeout, maxMessageSize, baseUrl,
-                new RegionResolver("us-east-1", "000000000000"));
+                new RegionResolver("us-east-1", "000000000000"), false, null);
     }
 
     SqsService(StorageBackend<String, Queue> queueStore, StorageBackend<String, List<Message>> messageStore,
                StorageBackend<String, Map<String, Long>> dedupStore,
                int defaultVisibilityTimeout, int maxMessageSize, String baseUrl,
                RegionResolver regionResolver) {
+        this(queueStore, messageStore, dedupStore, defaultVisibilityTimeout, maxMessageSize, baseUrl,
+                regionResolver, false, null);
+    }
+
+    SqsService(StorageBackend<String, Queue> queueStore, StorageBackend<String, List<Message>> messageStore,
+               StorageBackend<String, Map<String, Long>> dedupStore,
+               int defaultVisibilityTimeout, int maxMessageSize, String baseUrl,
+               RegionResolver regionResolver, boolean clearFifoDeduplicationCacheOnPurge,
+               SnsService snsService) {
         this.queueStore = queueStore;
         this.messageStore = messageStore;
         this.dedupStore = dedupStore;
@@ -79,6 +96,8 @@ public class SqsService {
         this.maxMessageSize = maxMessageSize;
         this.baseUrl = baseUrl;
         this.regionResolver = regionResolver;
+        this.clearFifoDeduplicationCacheOnPurge = clearFifoDeduplicationCacheOnPurge;
+        this.snsService = snsService;
         loadPersistedMessages();
         loadPersistedDedup();
     }
@@ -89,7 +108,7 @@ public class SqsService {
         }
         for (String key : messageStore.keys()) {
             messageStore.get(key).ifPresent(msgs ->
-                    messagesByQueue.put(key, new ConcurrentLinkedDeque<>(msgs)));
+                    messagesByQueue.put(key, new GuardedMessageQueue(msgs, messageStore, key)));
         }
     }
 
@@ -114,18 +133,9 @@ public class SqsService {
         }
     }
 
-    private void persistMessages(String storageKey) {
-        if (messageStore == null) {
-            return;
-        }
-
-        var messages = messagesByQueue.get(storageKey);
-        if (messages != null) {
-            // Weakly-consistent snapshot; messages modified concurrently may or may not appear.
-            messageStore.put(storageKey, new ArrayList<>(messages));
-        } else {
-            messageStore.delete(storageKey);
-        }
+    private GuardedMessageQueue getOrCreateQueue(String storageKey) {
+        return messagesByQueue.computeIfAbsent(storageKey,
+                k -> new GuardedMessageQueue(messageStore, k));
     }
 
     private void persistDedup(String storageKey) {
@@ -199,7 +209,7 @@ public class SqsService {
         }
 
         queueStore.put(storageKey, queue);
-        messagesByQueue.put(storageKey, new ConcurrentLinkedDeque<>());
+        messagesByQueue.put(storageKey, new GuardedMessageQueue(messageStore, storageKey));
         LOG.infov("Created {0} queue: {1} in region {2}", queue.isFifo() ? "FIFO" : "standard", queueName, region);
         return queue;
     }
@@ -215,7 +225,10 @@ public class SqsService {
                     "The specified queue does not exist.", 400);
         }
         queueStore.delete(storageKey);
-        messagesByQueue.remove(storageKey);
+        var removed = messagesByQueue.remove(storageKey);
+        if (removed != null) {
+            removed.close();
+        }
         deduplicationCache.remove(storageKey);
         if (messageStore != null) {
             messageStore.delete(storageKey);
@@ -276,17 +289,9 @@ public class SqsService {
         attrs.put("CreatedTimestamp", String.valueOf(queue.getCreatedTimestamp().getEpochSecond()));
         attrs.put("LastModifiedTimestamp", String.valueOf(queue.getLastModifiedTimestamp().getEpochSecond()));
 
-        var messages = messagesByQueue.getOrDefault(storageKey, new ConcurrentLinkedDeque<>());
-        long visible = 0, inFlight = 0;
-        for (Message m : messages) {
-            if (m.isVisible()) {
-                visible++;
-            } else {
-                inFlight++;
-            }
-        }
-        attrs.put("ApproximateNumberOfMessages", String.valueOf(visible));
-        attrs.put("ApproximateNumberOfMessagesNotVisible", String.valueOf(inFlight));
+        var counts = getOrCreateQueue(storageKey).messageCounts();
+        attrs.put("ApproximateNumberOfMessages", String.valueOf(counts.visible()));
+        attrs.put("ApproximateNumberOfMessagesNotVisible", String.valueOf(counts.inFlight()));
 
         if (attributeNames == null || attributeNames.contains("All")) {
             return attrs;
@@ -330,6 +335,21 @@ public class SqsService {
                     "Message body must be shorter than " + maxMessageSize + " bytes.", 400);
         }
 
+        int queueDelaySeconds = parseDelaySecondsAttribute(queue.getAttributes().get("DelaySeconds"));
+
+        // Resolve the effective delay:
+        //   - FIFO queues only support queue-level DelaySeconds per AWS SQS,
+        //     so any per-message value is ignored and we always use the
+        //     queue attribute. Without this, FIFO silently dropped the
+        //     queue-level default (issue #475).
+        //   - Standard queues honor per-message DelaySeconds when provided
+        //     (> 0). Applying the queue-level default on the standard path
+        //     requires distinguishing "omitted" from "explicit 0" in the
+        //     handlers, which the current int-parameter API cannot express;
+        //     that's left as follow-up work -- this patch only addresses
+        //     the FIFO regression called out in the issue.
+        int effectiveDelaySeconds = queue.isFifo() ? queueDelaySeconds : delaySeconds;
+
         // FIFO queue validation
         if (queue.isFifo()) {
             if (messageGroupId == null || messageGroupId.isEmpty()) {
@@ -339,7 +359,7 @@ public class SqsService {
             // Resolve deduplication ID
             String dedupId = messageDeduplicationId;
             if (dedupId == null || dedupId.isEmpty()) {
-                if ("true" .equalsIgnoreCase(queue.getAttributes().get("ContentBasedDeduplication"))) {
+                if ("true".equalsIgnoreCase(queue.getAttributes().get("ContentBasedDeduplication"))) {
                     dedupId = computeMd5(body);
                 } else {
                     throw new AwsException("InvalidParameterValue",
@@ -356,11 +376,9 @@ public class SqsService {
             persistDedup(storageKey);
             if (previous != null && Instant.now().isBefore(previous)) {
                 // Duplicate within window — return the original message idempotently
-                var messages = messagesByQueue.getOrDefault(storageKey, new ConcurrentLinkedDeque<>());
-                for (Message msg : messages) {
-                    if (dedupId.equals(msg.getMessageDeduplicationId())) {
-                        return msg;
-                    }
+                Message existing = getOrCreateQueue(storageKey).findByDeduplicationId(dedupId);
+                if (existing != null) {
+                    return existing;
                 }
             }
 
@@ -368,13 +386,15 @@ public class SqsService {
             message.setMessageGroupId(messageGroupId);
             message.setMessageDeduplicationId(dedupId);
             message.setSequenceNumber(sequenceCounter.incrementAndGet());
+            if (effectiveDelaySeconds > 0) {
+                message.setVisibleAt(Instant.now().plusSeconds(effectiveDelaySeconds));
+            }
             if (messageAttributes != null && !messageAttributes.isEmpty()) {
                 message.getMessageAttributes().putAll(messageAttributes);
                 message.updateMd5OfMessageAttributes();
             }
 
-            messagesByQueue.computeIfAbsent(storageKey, k -> new ConcurrentLinkedDeque<>()).add(message);
-            persistMessages(storageKey);
+            getOrCreateQueue(storageKey).addMessage(message);
             notifyReceivers(storageKey);
             LOG.debugv("Sent FIFO message {0} to queue {1}, group={2}, seq={3}",
                     message.getMessageId(), queueUrl, messageGroupId, message.getSequenceNumber());
@@ -383,19 +403,35 @@ public class SqsService {
 
         // Standard queue
         Message message = new Message(body);
-        if (delaySeconds > 0) {
-            message.setVisibleAt(Instant.now().plusSeconds(delaySeconds));
+        if (effectiveDelaySeconds > 0) {
+            message.setVisibleAt(Instant.now().plusSeconds(effectiveDelaySeconds));
         }
         if (messageAttributes != null && !messageAttributes.isEmpty()) {
             message.getMessageAttributes().putAll(messageAttributes);
             message.updateMd5OfMessageAttributes();
         }
 
-        messagesByQueue.computeIfAbsent(storageKey, k -> new ConcurrentLinkedDeque<>()).add(message);
-        persistMessages(storageKey);
+        getOrCreateQueue(storageKey).addMessage(message);
         notifyReceivers(storageKey);
         LOG.debugv("Sent message {0} to queue {1}", message.getMessageId(), queueUrl);
         return message;
+    }
+
+    /**
+     * Parse the queue-level DelaySeconds attribute. Returns 0 when the
+     * attribute is null, empty, non-numeric, or negative -- the queue falls
+     * back to "no default delay" rather than failing the SendMessage call.
+     */
+    private int parseDelaySecondsAttribute(String value) {
+        if (value == null || value.isEmpty()) {
+            return 0;
+        }
+        try {
+            int parsed = Integer.parseInt(value);
+            return parsed > 0 ? parsed : 0;
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     private void notifyReceivers(String storageKey) {
@@ -480,8 +516,8 @@ public class SqsService {
             try {
                 var rp = new com.fasterxml.jackson.databind.ObjectMapper().readTree(rawPolicy);
                 return new RedrivePolicy(
-                    rp.has("maxReceiveCount") ? rp.get("maxReceiveCount").asInt() : -1,
-                    rp.has("deadLetterTargetArn") ? rp.get("deadLetterTargetArn").asText() : null
+                        rp.has("maxReceiveCount") ? rp.get("maxReceiveCount").asInt() : -1,
+                        rp.has("deadLetterTargetArn") ? rp.get("deadLetterTargetArn").asText() : null
                 );
             } catch (Exception e) {
                 LOG.warnv("Failed to parse RedrivePolicy for queue {0}", queue.getQueueUrl());
@@ -496,115 +532,60 @@ public class SqsService {
             return Collections.emptyList();
         }
 
-        int effectiveTimeout = visibilityTimeout >= 0 ? visibilityTimeout : defaultVisibilityTimeout;
-        var messages = messagesByQueue.getOrDefault(storageKey, new ConcurrentLinkedDeque<>());
-        List<Message> result = new ArrayList<>();
-        List<Message> dlqMoves = new ArrayList<>();
+        int effectiveTimeout;
+        if (visibilityTimeout >= 0) {
+            effectiveTimeout = visibilityTimeout;
+        } else {
+            String queueVt = queue.getAttributes().get("VisibilityTimeout");
+            effectiveTimeout = queueVt != null ? Integer.parseInt(queueVt) : defaultVisibilityTimeout;
+        }
 
         RedrivePolicy rp = getOrParseRedrivePolicy(queue, storageKey);
         int maxReceiveCount = rp != null ? rp.maxReceiveCount() : -1;
         String deadLetterTargetArn = rp != null ? rp.deadLetterTargetArn() : null;
 
-        if (queue.isFifo()) {
-            // FIFO: enforce per-group ordering — skip groups with in-flight messages
-            Set<String> groupsWithInFlight = new HashSet<>();
-            Set<String> groupsDelivered = new HashSet<>();
+        var guardedQueue = getOrCreateQueue(storageKey);
+        var claimResult = guardedQueue.claimVisibleMessages(
+                maxMessages, effectiveTimeout, queue.isFifo(), maxReceiveCount, deadLetterTargetArn);
 
-            // First pass: find groups with in-flight (invisible) messages
-            for (Message msg : messages) {
-                if (!msg.isVisible() && msg.getMessageGroupId() != null) {
-                    groupsWithInFlight.add(msg.getMessageGroupId());
-                }
-            }
-
-            // Second pass: deliver next visible message per group
-            for (Message msg : messages) {
-                if (result.size() >= maxMessages) {
-                    break;
-                }
-                if (!msg.isVisible()) {
-                    continue;
-                }
-                String groupId = msg.getMessageGroupId();
-                if (groupId != null && groupsWithInFlight.contains(groupId)) {
-                    continue;
-                }
-                if (groupId != null && groupsDelivered.contains(groupId)) {
-                    continue;
-                }
-
-                msg.setReceiveCount(msg.getReceiveCount() + 1);
-
-                // Check DLQ routing
-                if (maxReceiveCount > 0 && deadLetterTargetArn != null && msg.getReceiveCount() > maxReceiveCount) {
-                    dlqMoves.add(msg);
-                    continue;
-                }
-
-                msg.setReceiptHandle(UUID.randomUUID().toString());
-                msg.setVisibleAt(Instant.now().plusSeconds(effectiveTimeout));
-                result.add(msg);
-                if (groupId != null) {
-                    groupsDelivered.add(groupId);
-                }
-            }
-        } else {
-            // Standard queue: deliver any visible message
-            for (Message msg : messages) {
-                if (result.size() >= maxMessages) {
-                    break;
-                }
-                if (msg.isVisible()) {
-                    msg.setReceiveCount(msg.getReceiveCount() + 1);
-
-                    // Check DLQ routing
-                    if (maxReceiveCount > 0 && deadLetterTargetArn != null && msg.getReceiveCount() > maxReceiveCount) {
-                        dlqMoves.add(msg);
-                        continue;
-                    }
-
-                    msg.setReceiptHandle(UUID.randomUUID().toString());
-                    msg.setVisibleAt(Instant.now().plusSeconds(effectiveTimeout));
-                    result.add(msg);
-                }
-            }
-        }
-
-        // Process DLQ moves
-        if (!dlqMoves.isEmpty()) {
+        // Route DLQ candidates to the dead-letter queue only if the destination resolves
+        if (!claimResult.dlqCandidates().isEmpty() && deadLetterTargetArn != null) {
             String dlqUrl = queueUrlFromArn(deadLetterTargetArn, region);
             if (dlqUrl != null) {
-                String dlqStorageKey = regionKey(region, dlqUrl);
-                var dlqMessages = messagesByQueue.computeIfAbsent(dlqStorageKey, k -> new ConcurrentLinkedDeque<>());
-                for (Message msg : dlqMoves) {
-                    messages.remove(msg);
-                    // Reset visibility and receipt handle for the new queue
+                var dlqCandidates = claimResult.dlqCandidates();
+                guardedQueue.removeMessages(dlqCandidates);
+                for (Message msg : dlqCandidates) {
                     msg.setVisibleAt(null);
                     msg.setReceiptHandle(null);
-                    dlqMessages.add(msg);
                 }
-                persistMessages(storageKey);
-                persistMessages(dlqStorageKey);
-                LOG.infov("Moved {0} messages to DLQ {1}", dlqMoves.size(), dlqUrl);
+                String dlqStorageKey = regionKey(region, dlqUrl);
+                getOrCreateQueue(dlqStorageKey).addAll(dlqCandidates);
+                LOG.infov("Moved {0} messages to DLQ {1}", dlqCandidates.size(), dlqUrl);
             }
-        } else if (!result.isEmpty()) {
-            persistMessages(storageKey);
         }
 
-        return result;
+        return claimResult.claimed();
     }
 
     private String queueUrlFromArn(String arn, String region) {
         if (arn == null || !arn.startsWith("arn:aws:sqs:")) {
             return null;
         }
-        String[] parts = arn.split(":");
-        if (parts.length < 6) {
+        try {
+            return AwsArnUtils.arnToQueueUrl(arn, baseUrl);
+        } catch (IllegalArgumentException e) {
             return null;
         }
-        String accountId = parts[4];
-        String queueName = parts[5];
-        return baseUrl + "/" + accountId + "/" + queueName;
+    }
+
+    public List<Message> peekMessages(String queueUrl) {
+        return peekMessages(queueUrl, regionResolver.getDefaultRegion());
+    }
+
+    public List<Message> peekMessages(String queueUrl, String region) {
+        String storageKey = regionKey(region, queueUrl);
+        ensureQueueExists(storageKey);
+        return getOrCreateQueue(storageKey).peekAll();
     }
 
     public void deleteMessage(String queueUrl, String receiptHandle) {
@@ -615,15 +596,12 @@ public class SqsService {
         String storageKey = regionKey(region, queueUrl);
         ensureQueueExists(storageKey);
 
-        var messages = messagesByQueue.getOrDefault(storageKey, new ConcurrentLinkedDeque<>());
-        boolean removed = messages.removeIf(m ->
-                receiptHandle.equals(m.getReceiptHandle()));
+        boolean removed = getOrCreateQueue(storageKey).removeByReceiptHandle(receiptHandle);
 
         if (!removed) {
             throw new AwsException("ReceiptHandleIsInvalid",
                     "The input receipt handle is not a valid receipt handle.", 400);
         }
-        persistMessages(storageKey);
         LOG.debugv("Deleted message with receipt handle {0}", receiptHandle);
     }
 
@@ -635,15 +613,11 @@ public class SqsService {
         String storageKey = regionKey(region, queueUrl);
         ensureQueueExists(storageKey);
 
-        var messages = messagesByQueue.getOrDefault(storageKey, new ConcurrentLinkedDeque<>());
-        for (Message msg : messages) {
-            if (receiptHandle.equals(msg.getReceiptHandle())) {
-                msg.setVisibleAt(Instant.now().plusSeconds(visibilityTimeout));
-                return;
-            }
+        boolean found = getOrCreateQueue(storageKey).changeVisibility(receiptHandle, visibilityTimeout);
+        if (!found) {
+            throw new AwsException("ReceiptHandleIsInvalid",
+                    "The input receipt handle is not a valid receipt handle.", 400);
         }
-        throw new AwsException("ReceiptHandleIsInvalid",
-                "The input receipt handle is not a valid receipt handle.", 400);
     }
 
     public void purgeQueue(String queueUrl) {
@@ -653,12 +627,18 @@ public class SqsService {
     public void purgeQueue(String queueUrl, String region) {
         String storageKey = regionKey(region, queueUrl);
         ensureQueueExists(storageKey);
-        var messages = messagesByQueue.get(storageKey);
-        if (messages != null) {
-            messages.clear();
+        getOrCreateQueue(storageKey).purge();
+        if (clearFifoDeduplicationCacheOnPurge) {
+            deduplicationCache.remove(storageKey);
+            if (dedupStore != null) {
+                dedupStore.delete(storageKey);
+            }
+            if (snsService != null) {
+                snsService.clearFifoDeduplicationCacheForSqsQueueSubscriptions(queueUrl, region);
+            }
         }
-        persistMessages(storageKey);
-        LOG.infov("Purged queue: {0}", queueUrl);
+        LOG.infov("Purged queue{0}: {1}",
+                clearFifoDeduplicationCacheOnPurge ? " (dedup cache cleared)" : "", queueUrl);
     }
 
     public void setQueueAttributes(String queueUrl, Map<String, String> attributes, String region) {
@@ -705,16 +685,13 @@ public class SqsService {
         String srcKey = regionKey(region, sourceUrl);
         ensureQueueExists(srcKey);
 
-        var srcMessages = messagesByQueue.getOrDefault(srcKey, new ConcurrentLinkedDeque<>());
+        var srcQueue = getOrCreateQueue(srcKey);
+        List<Message> drained = srcQueue.drainAll();
         if (destUrl != null) {
             String destKey = regionKey(region, destUrl);
             ensureQueueExists(destKey);
-            var destMessages = messagesByQueue.computeIfAbsent(destKey, k -> new ConcurrentLinkedDeque<>());
-            destMessages.addAll(srcMessages);
-            persistMessages(destKey);
+            getOrCreateQueue(destKey).addAll(drained);
         }
-        srcMessages.clear();
-        persistMessages(srcKey);
 
         LOG.infov("Moved messages from {0} to {1}", sourceArn, destinationArn != null ? destinationArn : "original source");
         return "task-" + UUID.randomUUID().toString();

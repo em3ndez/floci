@@ -1,15 +1,12 @@
 package io.github.hectorvent.floci.services.stepfunctions;
 
+import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
-import io.restassured.RestAssured;
-import io.restassured.config.EncoderConfig;
-import io.restassured.http.ContentType;
 import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import static io.restassured.RestAssured.given;
-import static org.hamcrest.Matchers.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 @QuarkusTest
@@ -20,9 +17,7 @@ class StepFunctionsJsonataIntegrationTest {
 
     @BeforeAll
     static void configureRestAssured() {
-        RestAssured.config = RestAssured.config().encoderConfig(
-                EncoderConfig.encoderConfig()
-                        .encodeContentTypeAs(SFN_CONTENT_TYPE, ContentType.TEXT));
+        RestAssuredJsonUtils.configureAwsContentTypes();
     }
 
     @Test
@@ -110,6 +105,88 @@ class StepFunctionsJsonataIntegrationTest {
         execArn = startExecution(smArn, "{\"type\": \"unknown\"}");
         output = waitForExecution(execArn);
         assertTrue(output.contains("default"));
+    }
+
+    @Test
+    void mapStateWithItemSelector_appliesTransformationAndContextVars() throws Exception {
+        // ItemSelector (JSONPath Map state) should transform each item using parent-state
+        // data and $$.Map.Item.Value / $$.Map.Item.Index context variables.
+        // Regression test for: Map state ignores Parameters/ItemSelector (issue #675)
+        String definition = """
+                {
+                    "StartAt": "ProcessItems",
+                    "States": {
+                        "ProcessItems": {
+                            "Type": "Map",
+                            "ItemsPath": "$.items",
+                            "ItemSelector": {
+                                "bucket.$": "$.bucket",
+                                "item.$": "$$.Map.Item.Value",
+                                "index.$": "$$.Map.Item.Index"
+                            },
+                            "ItemProcessor": {
+                                "StartAt": "Pass",
+                                "States": {
+                                    "Pass": {
+                                        "Type": "Pass",
+                                        "End": true
+                                    }
+                                }
+                            },
+                            "End": true
+                        }
+                    }
+                }
+                """;
+
+        String smArn = createStateMachine("map-itemselector-test", definition);
+        String execArn = startExecution(smArn, "{\"bucket\": \"my-bucket\", \"items\": [\"a\", \"b\"]}");
+        String output = waitForExecution(execArn);
+
+        assertTrue(output.contains("my-bucket"), "bucket from parent input should be injected");
+        assertTrue(output.contains("\"item\":\"a\"") || output.contains("\"item\": \"a\""),
+                "item value should be the raw item");
+        assertTrue(output.contains("\"index\":0") || output.contains("\"index\": 0"),
+                "index should start at 0");
+    }
+
+    @Test
+    void mapStateWithParameters_legacySyntax_appliesTransformation() throws Exception {
+        // Parameters is the legacy equivalent of ItemSelector; both must be applied.
+        String definition = """
+                {
+                    "StartAt": "ProcessItems",
+                    "States": {
+                        "ProcessItems": {
+                            "Type": "Map",
+                            "ItemsPath": "$.items",
+                            "Parameters": {
+                                "key.$": "$.key",
+                                "value.$": "$$.Map.Item.Value"
+                            },
+                            "ItemProcessor": {
+                                "StartAt": "Pass",
+                                "States": {
+                                    "Pass": {
+                                        "Type": "Pass",
+                                        "End": true
+                                    }
+                                }
+                            },
+                            "End": true
+                        }
+                    }
+                }
+                """;
+
+        String smArn = createStateMachine("map-parameters-test", definition);
+        String execArn = startExecution(smArn, "{\"key\": \"env\", \"items\": [1, 2]}");
+        String output = waitForExecution(execArn);
+
+        assertTrue(output.contains("\"key\":\"env\"") || output.contains("\"key\": \"env\""),
+                "key from parent input should be injected via Parameters");
+        assertTrue(output.contains("\"value\":1") || output.contains("\"value\": 1"),
+                "value should be the raw item");
     }
 
     @Test
@@ -225,6 +302,65 @@ class StepFunctionsJsonataIntegrationTest {
         String output = waitForExecution(execArn);
         assertTrue(output.contains("key"));
         assertTrue(output.contains("value"));
+    }
+
+    @Test
+    void jsonataPassState_withResult_rejected() {
+        // AWS rejects Result in JSONata states (SCHEMA_VALIDATION_FAILED).
+        // Result is a JSONPath-only field; the JSONata equivalent is Output.
+        String definition = """
+                {
+                    "QueryLanguage": "JSONata",
+                    "StartAt": "SetResult",
+                    "States": {
+                        "SetResult": {
+                            "Type": "Pass",
+                            "Result": {"status": "ok", "code": 200},
+                            "End": true
+                        }
+                    }
+                }
+                """;
+
+        given()
+                .header("X-Amz-Target", "AWSStepFunctions.CreateStateMachine")
+                .contentType(SFN_CONTENT_TYPE)
+                .body(String.format("""
+                        {"name":"jsonata-result-test","definition":%s,"roleArn":"%s","type":"STANDARD"}
+                        """, quote(definition), ROLE_ARN))
+                .when().post("/")
+                .then().statusCode(400);
+    }
+
+    @Test
+    void jsonataPassState_withParameters_rejected() {
+        // AWS rejects Parameters in JSONata states (SCHEMA_VALIDATION_FAILED).
+        // Parameters is a JSONPath-only field; the JSONata equivalent is Arguments.
+        String definition = """
+                {
+                    "QueryLanguage": "JSONata",
+                    "StartAt": "PrepareData",
+                    "States": {
+                        "PrepareData": {
+                            "Type": "Pass",
+                            "Parameters": {
+                                "created_at.$": "$$.Execution.StartTime"
+                            },
+                            "Output": {"processed": true},
+                            "End": true
+                        }
+                    }
+                }
+                """;
+
+        given()
+                .header("X-Amz-Target", "AWSStepFunctions.CreateStateMachine")
+                .contentType(SFN_CONTENT_TYPE)
+                .body(String.format("""
+                        {"name":"jsonata-parameters-test","definition":%s,"roleArn":"%s","type":"STANDARD"}
+                        """, quote(definition), ROLE_ARN))
+                .when().post("/")
+                .then().statusCode(400);
     }
 
     // ──────────────── Helpers ────────────────

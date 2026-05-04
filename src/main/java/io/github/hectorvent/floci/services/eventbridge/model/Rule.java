@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.eventbridge.model;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -51,4 +52,8 @@ public class Rule {
 
     public Instant getCreatedAt() { return createdAt; }
     public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
+
+    public String getRegion() {
+        return AwsArnUtils.regionOrDefault(arn, null);
+    }
 }

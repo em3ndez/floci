@@ -21,8 +21,12 @@ public class DbCluster {
     private boolean iamDatabaseAuthenticationEnabled;
     private List<String> dbClusterMembers = new ArrayList<>();
     private String parameterGroupName;
+    private String dbClusterResourceId;
+    private String dbClusterArn;
     private Instant createdAt;
     private int proxyPort;
+
+    private String dockerVolumeName; // null in in-memory mode; "floci-rds-<id>" otherwise
 
     // Transient — not persisted
     private transient String containerId;
@@ -90,11 +94,20 @@ public class DbCluster {
     public String getParameterGroupName() { return parameterGroupName; }
     public void setParameterGroupName(String parameterGroupName) { this.parameterGroupName = parameterGroupName; }
 
+    public String getDbClusterResourceId() { return dbClusterResourceId; }
+    public void setDbClusterResourceId(String dbClusterResourceId) { this.dbClusterResourceId = dbClusterResourceId; }
+
+    public String getDbClusterArn() { return dbClusterArn; }
+    public void setDbClusterArn(String dbClusterArn) { this.dbClusterArn = dbClusterArn; }
+
     public Instant getCreatedAt() { return createdAt; }
     public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
 
     public int getProxyPort() { return proxyPort; }
     public void setProxyPort(int proxyPort) { this.proxyPort = proxyPort; }
+
+    public String getDockerVolumeName() { return dockerVolumeName; }
+    public void setDockerVolumeName(String dockerVolumeName) { this.dockerVolumeName = dockerVolumeName; }
 
     public String getContainerId() { return containerId; }
     public void setContainerId(String containerId) { this.containerId = containerId; }

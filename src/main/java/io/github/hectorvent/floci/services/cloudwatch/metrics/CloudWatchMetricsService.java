@@ -100,6 +100,31 @@ public class CloudWatchMetricsService {
     public record Datapoint(Instant timestamp, double sampleCount, double sum,
                              double average, double minimum, double maximum, String unit) {}
 
+    public record MetricStat(
+            String namespace,
+            String metricName,
+            List<Dimension> dimensions,
+            int period,
+            String stat,
+            String unit
+    ) {}
+
+    public record MetricDataQuery(
+            String id,
+            MetricStat metricStat,
+            String expression,
+            String label,
+            boolean returnData
+    ) {}
+
+    public record MetricDataResult(
+            String id,
+            String label,
+            List<Instant> timestamps,
+            List<Double> values,
+            String statusCode
+    ) {}
+
     public List<Datapoint> getMetricStatistics(String namespace, String metricName,
                                                 List<Dimension> dimensions,
                                                 Instant startTime, Instant endTime,
@@ -159,6 +184,56 @@ public class CloudWatchMetricsService {
         return result;
     }
 
+    public List<MetricDataResult> getMetricData(
+            List<MetricDataQuery> queries,
+            Instant startTime,
+            Instant endTime,
+            String region) {
+
+        List<MetricDataResult> results = new ArrayList<>();
+
+        for (MetricDataQuery query : queries) {
+            if (!query.returnData()) {
+                continue;
+            }
+            if (query.metricStat() != null) {
+                MetricStat stat = query.metricStat();
+                int period = stat.period() > 0 ? stat.period() : 60;
+
+                List<Datapoint> datapoints = getMetricStatistics(
+                        stat.namespace(), stat.metricName(), stat.dimensions(),
+                        startTime, endTime, period,
+                        List.of(stat.stat()), stat.unit(), region);
+
+                List<Instant> timestamps = new ArrayList<>();
+                List<Double> values = new ArrayList<>();
+                for (Datapoint dp : datapoints) {
+                    timestamps.add(dp.timestamp());
+                    values.add(resolveStatValue(dp, stat.stat()));
+                }
+
+                String label = query.label() != null ? query.label() : stat.metricName();
+                results.add(new MetricDataResult(query.id(), label, timestamps, values, "Complete"));
+            }
+            // Expression-based queries are out of scope for this implementation
+        }
+        return results;
+    }
+
+    private double resolveStatValue(Datapoint dp, String stat) {
+        return switch (stat) {
+            case "Average" -> dp.average();
+            case "Sum" -> dp.sum();
+            case "Minimum" -> dp.minimum();
+            case "Maximum" -> dp.maximum();
+            case "SampleCount" -> dp.sampleCount();
+            default -> {
+                if (stat.startsWith("p")) yield dp.maximum();
+                else yield dp.average();
+            }
+        };
+    }
+
     public void putMetricAlarm(MetricAlarm alarm, String region) {
         if (alarm.getAlarmArn() == null) {
             alarm.setAlarmArn(regionResolver.buildArn("cloudwatch", region, "alarm:" + alarm.getAlarmName()));
@@ -200,6 +275,37 @@ public class CloudWatchMetricsService {
 
         alarmStore.put(key, alarm);
         LOG.infov("SetAlarmState: {0} -> {1}", alarmName, stateValue);
+    }
+
+    public Map<String, String> listTagsForResource(String resourceArn, String region) {
+        return alarmStore.scan(k -> k.startsWith(region + "::"))
+                .stream()
+                .filter(a -> resourceArn.equals(a.getAlarmArn()))
+                .findFirst()
+                .map(MetricAlarm::getTags)
+                .orElse(Map.of());
+    }
+
+    public void tagResource(String resourceArn, Map<String, String> tags, String region) {
+        alarmStore.scan(k -> k.startsWith(region + "::"))
+                .stream()
+                .filter(a -> resourceArn.equals(a.getAlarmArn()))
+                .findFirst()
+                .ifPresent(alarm -> {
+                    alarm.getTags().putAll(tags);
+                    alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
+                });
+    }
+
+    public void untagResource(String resourceArn, List<String> tagKeys, String region) {
+        alarmStore.scan(k -> k.startsWith(region + "::"))
+                .stream()
+                .filter(a -> resourceArn.equals(a.getAlarmArn()))
+                .findFirst()
+                .ifPresent(alarm -> {
+                    tagKeys.forEach(alarm.getTags()::remove);
+                    alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
+                });
     }
 
     // ──────────────────────────── Helpers ────────────────────────────

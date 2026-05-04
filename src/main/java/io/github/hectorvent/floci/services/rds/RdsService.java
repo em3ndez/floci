@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.rds;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.rds.container.RdsContainerHandle;
@@ -38,16 +40,22 @@ public class RdsService {
     private final StorageBackend<String, DbParameterGroup> parameterGroups;
     private final RdsContainerManager containerManager;
     private final RdsProxyManager proxyManager;
+    private final RegionResolver regionResolver;
     private final EmulatorConfig config;
+    private final ServiceConfigAccess serviceConfigAccess;
     private final Set<Integer> usedPorts = ConcurrentHashMap.newKeySet();
 
     @Inject
     public RdsService(RdsContainerManager containerManager,
                       RdsProxyManager proxyManager,
-                      EmulatorConfig config) {
+                      RegionResolver regionResolver,
+                      EmulatorConfig config,
+                      ServiceConfigAccess serviceConfigAccess) {
         this.containerManager = containerManager;
         this.proxyManager = proxyManager;
+        this.regionResolver = regionResolver;
         this.config = config;
+        this.serviceConfigAccess = serviceConfigAccess;
         this.instances = new InMemoryStorage<>();
         this.clusters = new InMemoryStorage<>();
         this.parameterGroups = new InMemoryStorage<>();
@@ -102,6 +110,13 @@ public class RdsService {
         instance.setContainerId(containerId);
         instance.setContainerHost(containerHost);
         instance.setContainerPort(containerPort);
+        if (dbClusterIdentifier == null || dbClusterIdentifier.isBlank()) {
+            instance.setDockerVolumeName(isInMemory() ? null : "floci-rds-" + id);
+        }
+
+        String region = regionResolver.getDefaultRegion();
+        instance.setDbiResourceId("db-" + java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 24).toUpperCase());
+        instance.setDbInstanceArn(regionResolver.buildArn("rds", region, "db:" + id));
 
         String effectiveMasterUser = masterUsername != null ? masterUsername : "root";
         proxyManager.startProxy(id, engine, iamEnabled, proxyPort, backendHost, backendPort,
@@ -129,7 +144,7 @@ public class RdsService {
 
     public Collection<DbInstance> listDbInstances(String filterId) {
         if (filterId != null && !filterId.isBlank()) {
-            return instances.get(filterId).map(List::of).orElse(List.of());
+            return instances.scan(k -> k.equalsIgnoreCase(filterId));
         }
         return instances.scan(k -> true);
     }
@@ -203,9 +218,12 @@ public class RdsService {
 
         String clusterId = instance.getDbClusterIdentifier();
         if (clusterId == null || clusterId.isBlank()) {
-            // Standalone — stop its container
+            // Standalone — stop its container and clean up its Docker volume
             if (instance.getContainerId() != null) {
                 containerManager.stop(buildHandle(instance));
+            }
+            if (instance.getDockerVolumeName() != null) {
+                containerManager.removeVolume(instance.getDbInstanceIdentifier());
             }
         } else {
             // Cluster member — remove from cluster's member list
@@ -245,6 +263,11 @@ public class RdsService {
         cluster.setContainerId(handle.getContainerId());
         cluster.setContainerHost(handle.getHost());
         cluster.setContainerPort(handle.getPort());
+        cluster.setDockerVolumeName(isInMemory() ? null : "floci-rds-" + id);
+
+        String region = regionResolver.getDefaultRegion();
+        cluster.setDbClusterResourceId("cluster-" + java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 24).toUpperCase());
+        cluster.setDbClusterArn(regionResolver.buildArn("rds", region, "cluster:" + id));
 
         String effectiveMasterUser = masterUsername != null ? masterUsername : "root";
         proxyManager.startProxy(id, engine, iamEnabled, proxyPort, handle.getHost(), handle.getPort(),
@@ -264,7 +287,7 @@ public class RdsService {
 
     public Collection<DbCluster> listDbClusters(String filterId) {
         if (filterId != null && !filterId.isBlank()) {
-            return clusters.get(filterId).map(List::of).orElse(List.of());
+            return clusters.scan(k -> k.equalsIgnoreCase(filterId));
         }
         return clusters.scan(k -> true);
     }
@@ -299,6 +322,9 @@ public class RdsService {
 
         if (cluster.getContainerId() != null) {
             containerManager.stop(buildClusterHandle(cluster));
+        }
+        if (cluster.getDockerVolumeName() != null) {
+            containerManager.removeVolume(id);
         }
 
         releaseProxyPort(cluster.getProxyPort());
@@ -356,6 +382,9 @@ public class RdsService {
         if (instance == null) {
             return false;
         }
+        if (!instance.getMasterUsername().equals(clientUser)) {
+            return true; // non-master user: backend is the authority
+        }
         return password != null && password.equals(instance.getMasterPassword());
     }
 
@@ -364,10 +393,17 @@ public class RdsService {
         if (cluster == null) {
             return false;
         }
+        if (!cluster.getMasterUsername().equals(clientUser)) {
+            return true; // non-master user: backend is the authority
+        }
         return password != null && password.equals(cluster.getMasterPassword());
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private boolean isInMemory() {
+        return "memory".equals(serviceConfigAccess.storageMode("rds"));
+    }
 
     private DatabaseEngine resolveEngine(String engineParam) {
         if (engineParam == null) {

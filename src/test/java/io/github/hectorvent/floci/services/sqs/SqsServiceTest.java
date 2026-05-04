@@ -1,7 +1,9 @@
 package io.github.hectorvent.floci.services.sqs;
 
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.github.hectorvent.floci.services.sqs.model.Queue;
 import org.junit.jupiter.api.BeforeEach;
@@ -11,6 +13,8 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 
 class SqsServiceTest {
 
@@ -287,5 +291,149 @@ class SqsServiceTest {
         // ContentBasedDeduplication is false by default
         assertThrows(AwsException.class, () ->
                 sqsService.sendMessage(queue.getQueueUrl(), "msg", 0, "group1", null));
+    }
+
+    @Test
+    void receiveMessageUsesQueueVisibilityTimeoutWhenNotSpecified() {
+        // Create queue with a short visibility timeout (1 second)
+        Queue queue = sqsService.createQueue("short-vt-queue",
+                Map.of("VisibilityTimeout", "1"));
+        sqsService.sendMessage(queue.getQueueUrl(), "test-msg", 0);
+
+        // Receive without specifying visibility timeout (-1 means "use queue default")
+        List<Message> first = sqsService.receiveMessage(queue.getQueueUrl(), 1, -1, 0);
+        assertEquals(1, first.size());
+
+        // Message should be invisible immediately after receive
+        List<Message> second = sqsService.receiveMessage(queue.getQueueUrl(), 1, -1, 0);
+        assertTrue(second.isEmpty());
+
+        // Wait for the queue's visibility timeout (1s) to expire, not the global default (30s)
+        try { Thread.sleep(1100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+        // Message should now be visible again
+        List<Message> third = sqsService.receiveMessage(queue.getQueueUrl(), 1, -1, 0);
+        assertEquals(1, third.size(), "Message should become visible after queue's VisibilityTimeout (1s), not global default (30s)");
+    }
+
+    // --- Queue-level DelaySeconds for FIFO queues (issue #475) ---
+
+    @Test
+    void queueLevelDelaySecondsAppliesToFifoQueue() {
+        Queue queue = sqsService.createQueue("delay-fifo.fifo",
+                Map.of("ContentBasedDeduplication", "true", "DelaySeconds", "1"));
+        sqsService.sendMessage(queue.getQueueUrl(), "msg", 0, "group1", null);
+
+        List<Message> immediate = sqsService.receiveMessage(queue.getQueueUrl(), 1, 0, 0);
+        assertTrue(immediate.isEmpty(),
+                "FIFO queue should honor queue-level DelaySeconds (issue #475)");
+
+        try { Thread.sleep(1100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+        List<Message> later = sqsService.receiveMessage(queue.getQueueUrl(), 1, 0, 0);
+        assertEquals(1, later.size(),
+                "Message should become visible once DelaySeconds elapses");
+    }
+
+    @Test
+    void fifoQueueIgnoresPerMessageDelaySeconds() {
+        // AWS SQS FIFO queues only support queue-level DelaySeconds; any
+        // per-message value is ignored. Here the queue default is 0 and the
+        // caller passes a positive per-message delay -- the message must be
+        // immediately visible.
+        Queue queue = sqsService.createQueue("fifo-ignores-per-msg.fifo",
+                Map.of("ContentBasedDeduplication", "true"));
+        sqsService.sendMessage(queue.getQueueUrl(), "msg", 60, "group1", null);
+
+        List<Message> immediate = sqsService.receiveMessage(queue.getQueueUrl(), 1, 0, 0);
+        assertEquals(1, immediate.size(),
+                "FIFO queues must ignore per-message DelaySeconds");
+    }
+
+    // --- clearFifoDeduplicationCacheOnPurge tests ---
+
+    @Test
+    void purgeQueueClearsFifoDeduplicationCacheWhenEnabled() {
+        final var service = new SqsService(
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                30, 262144, BASE_URL, new RegionResolver("us-east-1", "000000000000"), true, null);
+
+        final var queue = service.createQueue("dedup-clear.fifo", Map.of("ContentBasedDeduplication", "true"));
+
+        // First send — message M1 added, dedup cache populated with "dedup-1"
+        final var m1 = service.sendMessage(queue.getQueueUrl(), "msg", 0, "group1", "dedup-1");
+        assertNotNull(m1.getMessageId());
+
+        // Purge clears both messages and the dedup cache
+        service.purgeQueue(queue.getQueueUrl());
+        assertTrue(service.receiveMessage(queue.getQueueUrl(), 10, 0, 0).isEmpty(),
+                "Queue must be empty after purge");
+
+        // Re-send with the same dedup ID — cache was cleared so this is treated as a fresh send
+        final var m2 = service.sendMessage(queue.getQueueUrl(), "msg", 0, "group1", "dedup-1");
+        assertNotNull(m2.getMessageId());
+
+        final var received = service.receiveMessage(queue.getQueueUrl(), 10, 30, 0);
+        assertEquals(1, received.size(), "One message must be in the queue after re-send");
+
+        // Third send with same dedup ID — fresh cache entry from m2 deduplicates correctly
+        final var m3 = service.sendMessage(queue.getQueueUrl(), "msg", 0, "group1", "dedup-1");
+        assertEquals(m2.getMessageId(), m3.getMessageId(),
+                "Dedup must work with the fresh cache entry after purge");
+    }
+
+    @Test
+    void purgeQueuePreservesFifoDeduplicationCacheByDefault() {
+        // Default service has clearFifoDeduplicationCacheOnPurge=false
+        final var queue = sqsService.createQueue("dedup-preserve.fifo",
+                Map.of("ContentBasedDeduplication", "true"));
+
+        // Send and then purge — messages are gone but dedup cache is intact
+        sqsService.sendMessage(queue.getQueueUrl(), "msg", 0, "group1", "dedup-1");
+        sqsService.purgeQueue(queue.getQueueUrl());
+
+        assertTrue(sqsService.receiveMessage(queue.getQueueUrl(), 10, 0, 0).isEmpty(),
+                "Queue must be empty after purge");
+
+        // Re-send with same dedup ID — dedup cache fires but finds no message (purged),
+        // so it falls through and creates a new message
+        sqsService.sendMessage(queue.getQueueUrl(), "msg", 0, "group1", "dedup-1");
+
+        final var received = sqsService.receiveMessage(queue.getQueueUrl(), 10, 30, 0);
+        assertEquals(1, received.size(),
+                "Re-send after purge must produce exactly one message in the queue");
+    }
+
+    @Test
+    void purgeQueueClearsDedupStoreWhenEnabled() {
+        final var dedupStore = new InMemoryStorage<String, Map<String, Long>>();
+        final var service = new SqsService(
+                new InMemoryStorage<>(), new InMemoryStorage<>(), dedupStore,
+                30, 262144, BASE_URL, new RegionResolver("us-east-1", "000000000000"), true, null);
+
+        final var queue = service.createQueue("dedup-store-clear.fifo",
+                Map.of("ContentBasedDeduplication", "true"));
+
+        // Send a message — dedup entry must be persisted to the store
+        service.sendMessage(queue.getQueueUrl(), "msg", 0, "group1", "dedup-1");
+        assertFalse(dedupStore.keys().isEmpty(),
+                "Dedup store must have an entry after sending a FIFO message");
+
+        // Purge with flag enabled — dedupStore entry for the queue must be removed
+        service.purgeQueue(queue.getQueueUrl());
+        assertTrue(dedupStore.keys().isEmpty(),
+                "Dedup store must be empty after purge with clearFifoDeduplicationCacheOnPurge=true");
+    }
+
+    @Test
+    void purgeQueueWithClearFifoDelegatesToSnsForFifoDedupOnSubscribedTopics() {
+        final var sns = mock(SnsService.class);
+        final var service = new SqsService(
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                30, 262144, BASE_URL, new RegionResolver("us-east-1", "000000000000"), true, sns);
+        final var queue = service.createQueue("sns-dedup-delegate.fifo", Map.of("FifoQueue", "true"));
+        service.purgeQueue(queue.getQueueUrl());
+        verify(sns).clearFifoDeduplicationCacheForSqsQueueSubscriptions(
+                queue.getQueueUrl(), "us-east-1");
     }
 }

@@ -14,7 +14,11 @@ public final class AwsNamespaces {
     public static final String EC  = "http://elasticache.amazonaws.com/doc/2015-02-02/";
     public static final String CW  = "http://monitoring.amazonaws.com/doc/2010-08-01/";
     public static final String S3  = "http://s3.amazonaws.com/doc/2006-03-01/";
+    public static final String S3_CONTROL = "http://awss3control.amazonaws.com/doc/2018-08-20/";
     public static final String SES = "http://ses.amazonaws.com/doc/2010-12-01/";
+    public static final String EC2    = "http://ec2.amazonaws.com/doc/2016-11-15/";
+    public static final String ELB_V2      = "https://elasticloadbalancing.amazonaws.com/doc/2015-12-01/";
+    public static final String AUTOSCALING = "https://autoscaling.amazonaws.com/doc/2011-01-01/";
 
     private AwsNamespaces() {}
 }

@@ -21,9 +21,13 @@ public class Bucket {
     private String policy;
     private String corsConfiguration;
     private String lifecycleConfiguration;
+    private String transitionDefaultMinimumObjectSize; // x-amz-transition-default-minimum-object-size header value
     private String acl; // XML representation or JSON stub
     private String encryptionConfiguration; // XML string
+    private String publicAccessBlockConfiguration; // XML string
+    private String ownershipControlsConfiguration; // XML string
     private String region;
+    private WebsiteConfiguration websiteConfiguration;
 
     public Bucket() {
         this.tags = new HashMap<>();
@@ -70,12 +74,30 @@ public class Bucket {
     public String getLifecycleConfiguration() { return lifecycleConfiguration; }
     public void setLifecycleConfiguration(String lifecycleConfiguration) { this.lifecycleConfiguration = lifecycleConfiguration; }
 
+    public String getTransitionDefaultMinimumObjectSize() { return transitionDefaultMinimumObjectSize; }
+    public void setTransitionDefaultMinimumObjectSize(String transitionDefaultMinimumObjectSize) {
+        this.transitionDefaultMinimumObjectSize = transitionDefaultMinimumObjectSize;
+    }
+
     public String getAcl() { return acl; }
     public void setAcl(String acl) { this.acl = acl; }
 
     public String getEncryptionConfiguration() { return encryptionConfiguration; }
     public void setEncryptionConfiguration(String encryptionConfiguration) { this.encryptionConfiguration = encryptionConfiguration; }
 
+    public String getPublicAccessBlockConfiguration() { return publicAccessBlockConfiguration; }
+    public void setPublicAccessBlockConfiguration(String publicAccessBlockConfiguration) {
+        this.publicAccessBlockConfiguration = publicAccessBlockConfiguration;
+    }
+
+    public String getOwnershipControlsConfiguration() { return ownershipControlsConfiguration; }
+    public void setOwnershipControlsConfiguration(String ownershipControlsConfiguration) {
+        this.ownershipControlsConfiguration = ownershipControlsConfiguration;
+    }
+
     public String getRegion() { return region; }
     public void setRegion(String region) { this.region = region; }
+
+    public WebsiteConfiguration getWebsiteConfiguration() { return websiteConfiguration; }
+    public void setWebsiteConfiguration(WebsiteConfiguration websiteConfiguration) { this.websiteConfiguration = websiteConfiguration; }
 }

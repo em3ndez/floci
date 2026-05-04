@@ -27,6 +27,14 @@
 | `TagResource` | Tag a table |
 | `UntagResource` | Remove tags |
 | `ListTagsOfResource` | List tags |
+| `DescribeContinuousBackups` | Get PITR backup configuration |
+| `UpdateContinuousBackups` | Enable/disable PITR |
+| `DescribeKinesisStreamingDestination` | List Kinesis streaming destinations |
+| `EnableKinesisStreamingDestination` | Enable Kinesis streaming for a table |
+| `DisableKinesisStreamingDestination` | Disable Kinesis streaming for a table |
+| `ExportTableToPointInTime` | Export table data to S3 as gzip NDJSON |
+| `DescribeExport` | Get export status and metadata |
+| `ListExports` | List exports, optionally filtered by table ARN |
 
 ## Streams {#streams}
 
@@ -42,7 +50,7 @@ DynamoDB Streams are supported via a separate target (`DynamoDBStreams_20120810`
 ## Examples
 
 ```bash
-export AWS_ENDPOINT=http://localhost:4566
+export AWS_ENDPOINT_URL=http://localhost:4566
 
 # Create a table
 aws dynamodb create-table \
@@ -52,45 +60,45 @@ aws dynamodb create-table \
   --key-schema \
     AttributeName=userId,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Put an item
 aws dynamodb put-item \
   --table-name Users \
   --item '{"userId":{"S":"u1"},"name":{"S":"Alice"},"age":{"N":"30"}}' \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Get an item
 aws dynamodb get-item \
   --table-name Users \
   --key '{"userId":{"S":"u1"}}' \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Query (partition key)
 aws dynamodb query \
   --table-name Users \
   --key-condition-expression "userId = :id" \
   --expression-attribute-values '{":id":{"S":"u1"}}' \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Scan with filter
 aws dynamodb scan \
   --table-name Users \
   --filter-expression "age > :min" \
   --expression-attribute-values '{":min":{"N":"25"}}' \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Enable TTL
 aws dynamodb update-time-to-live \
   --table-name Users \
   --time-to-live-specification Enabled=true,AttributeName=expiresAt \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Enable Streams
 aws dynamodb update-table \
   --table-name Users \
   --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 ```
 
 ## Global Secondary Indexes
@@ -108,5 +116,37 @@ aws dynamodb create-table \
     "Projection": {"ProjectionType":"ALL"}
   }]' \
   --billing-mode PAY_PER_REQUEST \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
+## Export to S3
+
+Export table data to an S3 bucket as gzip-compressed NDJSON (DynamoDB JSON format):
+
+```bash
+# Create a bucket to receive the export
+aws s3 mb s3://my-exports --endpoint-url $AWS_ENDPOINT_URL
+
+# Start an export
+EXPORT_ARN=$(aws dynamodb export-table-to-point-in-time \
+  --table-arn arn:aws:dynamodb:us-east-1:000000000000:table/Users \
+  --s3-bucket my-exports \
+  --s3-prefix exports \
+  --export-format DYNAMODB_JSON \
+  --query ExportDescription.ExportArn --output text \
+  --endpoint-url $AWS_ENDPOINT_URL)
+
+# Poll until COMPLETED
+aws dynamodb describe-export \
+  --export-arn $EXPORT_ARN \
+  --query ExportDescription.ExportStatus \
+  --endpoint-url $AWS_ENDPOINT_URL
+
+# List exports for a table
+aws dynamodb list-exports \
+  --table-arn arn:aws:dynamodb:us-east-1:000000000000:table/Users \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
+The export writes to `s3://<bucket>/<prefix>/AWSDynamoDB/<exportId>/data/` as one or more `.json.gz` files, along with `manifest-summary.json` and `manifest-files.json` — the same layout as real AWS DynamoDB exports.
 ```

@@ -1,5 +1,65 @@
 [
   {
+    "name": "io.github.hectorvent.floci.services.apigateway.VtlTemplateEngine$InputVariable",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "io.github.hectorvent.floci.services.apigateway.VtlTemplateEngine$UtilVariable",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "io.github.hectorvent.floci.services.apigateway.VtlTemplateEngine$ResponseOverride",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.util.introspection.UberspectImpl",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.util.introspection.TypeConversionHandlerImpl",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.runtime.resource.ResourceManagerImpl",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.runtime.resource.ResourceCacheImpl",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.runtime.ParserPoolImpl",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.runtime.resource.loader.FileResourceLoader",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.runtime.resource.loader.StringResourceLoader",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
     "name": "com.fasterxml.jackson.dataformat.cbor.CBORFactory",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
@@ -2345,57 +2405,148 @@
   {
     "name": "org.bouncycastle.jce.provider.BouncyCastleProvider",
     "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
     "allDeclaredMethods": true,
     "allDeclaredFields": true
   },
   {
     "name": "org.bouncycastle.jcajce.provider.asymmetric.rsa.KeyFactorySpi",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
     "name": "org.bouncycastle.jcajce.provider.asymmetric.ec.KeyFactorySpi$EC",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
     "name": "org.bouncycastle.jcajce.provider.asymmetric.rsa.KeyPairGeneratorSpi",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
     "name": "org.bouncycastle.jcajce.provider.asymmetric.ec.KeyPairGeneratorSpi$EC",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
     "name": "org.bouncycastle.jcajce.provider.digest.SHA256$Digest",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
     "name": "org.bouncycastle.jcajce.provider.digest.SHA384$Digest",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
     "name": "org.bouncycastle.jcajce.provider.asymmetric.rsa.DigestSignatureSpi$SHA256",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
     "name": "org.bouncycastle.jcajce.provider.asymmetric.ec.SignatureSpi$ecDSA256",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
     "name": "org.bouncycastle.jcajce.provider.symmetric.AES$ECB",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
     "name": "org.bouncycastle.jcajce.provider.symmetric.PBEPBKDF2$PBKDF2withSHA256",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.bouncycastle.jcajce.provider.digest.SHA512$Digest",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.bouncycastle.jcajce.provider.asymmetric.rsa.DigestSignatureSpi$SHA512",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.bouncycastle.jcajce.provider.asymmetric.ec.SignatureSpi$ecDSA512",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.bouncycastle.jcajce.provider.symmetric.AES$CBC",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.bouncycastle.jcajce.provider.asymmetric.EC$Mappings",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.bouncycastle.jcajce.provider.asymmetric.RSA$Mappings",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.bouncycastle.jcajce.provider.asymmetric.X509$Mappings",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.bouncycastle.jcajce.provider.digest.SHA512$Mappings",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.bouncycastle.jcajce.provider.symmetric.AES$Mappings",
+    "allDeclaredConstructors": true,
+    "allPublicConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   }
 ]

@@ -1,34 +1,34 @@
 package io.github.hectorvent.floci.services.lambda.launcher;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
+import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
+import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
+import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
 import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.async.ResultCallback;
-import com.github.dockerjava.api.command.CreateContainerCmd;
-import com.github.dockerjava.api.command.CreateContainerResponse;
-import com.github.dockerjava.api.model.Frame;
-import com.github.dockerjava.api.model.HostConfig;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
+
+import java.io.Closeable;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
+import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Starts and stops Docker containers for Lambda function execution.
@@ -43,47 +43,81 @@ public class ContainerLauncher {
 
     private static final Logger LOG = Logger.getLogger(ContainerLauncher.class);
     private static final String TASK_DIR = "/var/task";
+    private static final String RUNTIME_DIR = "/var/runtime";
 
     private static final DateTimeFormatter LOG_STREAM_DATE_FMT = DateTimeFormatter.ofPattern("yyyy/MM/dd");
 
-    private final DockerClient dockerClient;
-    private final ImageCacheService imageCacheService;
+    private final ContainerBuilder containerBuilder;
+    private final ContainerLifecycleManager lifecycleManager;
+    private final ContainerLogStreamer logStreamer;
     private final ImageResolver imageResolver;
     private final RuntimeApiServerFactory runtimeApiServerFactory;
     private final DockerHostResolver dockerHostResolver;
     private final EmulatorConfig config;
-    private final CloudWatchLogsService cloudWatchLogsService;
+    private final EcrRegistryManager ecrRegistryManager;
+    private final EmbeddedDnsServer embeddedDnsServer;
+
+    /** Matches an AWS-shaped ECR image URI: {@code <account>.dkr.ecr.<region>.amazonaws.com/<repo>[:tag]}. */
+    private static final java.util.regex.Pattern AWS_ECR_URI =
+            java.util.regex.Pattern.compile("^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.amazonaws\\.com/(.+)$");
 
     @Inject
-    public ContainerLauncher(DockerClient dockerClient,
-                              ImageCacheService imageCacheService,
-                              ImageResolver imageResolver,
-                              RuntimeApiServerFactory runtimeApiServerFactory,
-                              DockerHostResolver dockerHostResolver,
-                              EmulatorConfig config,
-                              CloudWatchLogsService cloudWatchLogsService) {
-        this.dockerClient = dockerClient;
-        this.imageCacheService = imageCacheService;
+    public ContainerLauncher(ContainerBuilder containerBuilder,
+                             ContainerLifecycleManager lifecycleManager,
+                             ContainerLogStreamer logStreamer,
+                             ImageResolver imageResolver,
+                             RuntimeApiServerFactory runtimeApiServerFactory,
+                             DockerHostResolver dockerHostResolver,
+                             EmulatorConfig config,
+                             EcrRegistryManager ecrRegistryManager,
+                             EmbeddedDnsServer embeddedDnsServer) {
+        this.containerBuilder = containerBuilder;
+        this.lifecycleManager = lifecycleManager;
+        this.logStreamer = logStreamer;
         this.imageResolver = imageResolver;
         this.runtimeApiServerFactory = runtimeApiServerFactory;
         this.dockerHostResolver = dockerHostResolver;
         this.config = config;
-        this.cloudWatchLogsService = cloudWatchLogsService;
+        this.ecrRegistryManager = ecrRegistryManager;
+        this.embeddedDnsServer = embeddedDnsServer;
+    }
+
+    /**
+     * Rewrites real-AWS-shaped ECR image URIs to point at Floci's loopback registry.
+     * Stored ImageUri is preserved (so describe-function returns the original);
+     * the rewrite is only applied immediately before the docker pull.
+     */
+    private String rewriteForEmulatedRegistry(String image) {
+        if (image == null) {
+            return null;
+        }
+        java.util.regex.Matcher m = AWS_ECR_URI.matcher(image);
+        if (!m.matches()) {
+            return image;
+        }
+        String account = m.group(1);
+        String region = m.group(2);
+        String repoAndTag = m.group(3);
+        ecrRegistryManager.ensureStarted();
+        int port = ecrRegistryManager.effectivePort();
+        String rewritten = account + ".dkr.ecr." + region + ".localhost:" + port + "/" + repoAndTag;
+        LOG.infov("Rewriting ECR image URI {0} -> {1}", image, rewritten);
+        return rewritten;
     }
 
     public ContainerHandle launch(LambdaFunction fn) {
         LOG.infov("Launching container for function: {0}", fn.getFunctionName());
 
         // For Zip functions, verify code exists before allocating any resources.
-        // Without this check, a container could start with an empty /var/task if the
-        // function was deleted (or code was replaced) between the invocation being
-        // enqueued and the container being launched.
-        if (fn.getCodeLocalPath() != null) {
-            Path codePath = Path.of(fn.getCodeLocalPath());
-            if (!Files.exists(codePath)) {
-                throw new RuntimeException("Code directory not found for function '"
-                        + fn.getFunctionName() + "': " + fn.getCodeLocalPath()
-                        + " (function may have been deleted or updated)");
+        // Hot-reload functions use a bind-mount; the Docker daemon validates the path at start.
+        if (!fn.isHotReload()) {
+            if (fn.getCodeLocalPath() != null) {
+                Path codePath = Path.of(fn.getCodeLocalPath());
+                if (!Files.exists(codePath)) {
+                    throw new RuntimeException("Code directory not found for function '"
+                            + fn.getFunctionName() + "': " + fn.getCodeLocalPath()
+                            + " (function may have been deleted or updated)");
+                }
             }
         }
 
@@ -95,12 +129,31 @@ public class ContainerLauncher {
                 ? fn.getImageUri()
                 : imageResolver.resolve(fn.getRuntime());
 
-        // Ensure image is available locally
-        imageCacheService.ensureImageExists(image);
+        // If this is an AWS-shaped ECR URI, rewrite it to Floci's loopback registry
+        image = rewriteForEmulatedRegistry(image);
 
         // Determine host address reachable from container
         String hostAddress = dockerHostResolver.resolve();
         String runtimeApiEndpoint = hostAddress + ":" + runtimeApiServer.getPort();
+
+        // Give the container a human-readable name (needed for log stream name below)
+        String shortId = java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        String containerName = "floci-" + fn.getFunctionName() + "-" + shortId;
+
+        // CloudWatch log coordinates — computed here so they can be injected as env vars
+        String cwLogGroup  = "/aws/lambda/" + fn.getFunctionName();
+        String cwLogStream = LOG_STREAM_DATE_FMT.format(LocalDate.now()) + "/[$LATEST]" + shortId;
+        String lambdaRegion = extractRegionFromArn(fn.getFunctionArn(), config.defaultRegion());
+
+        // Floci endpoint reachable from inside the container.
+        // When the embedded DNS server is active, Lambda containers already have it wired as their
+        // resolver and can reach Floci by the configured hostname (or the default DNS suffix).
+        // Fall back to the raw Docker host IP when the embedded DNS is not running (local dev mode).
+        int flociPort = java.net.URI.create(config.baseUrl()).getPort();
+        String flociHostname = embeddedDnsServer.getServerIp().isPresent()
+                ? config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX)
+                : hostAddress;
+        String flociEndpoint = "http://" + flociHostname + ":" + flociPort;
 
         // Build env vars
         List<String> env = new ArrayList<>();
@@ -109,111 +162,89 @@ public class ContainerLauncher {
         env.add("AWS_LAMBDA_FUNCTION_MEMORY_SIZE=" + fn.getMemorySize());
         env.add("AWS_LAMBDA_FUNCTION_TIMEOUT=" + fn.getTimeout());
         env.add("AWS_LAMBDA_FUNCTION_VERSION=$LATEST");
-        env.add("_HANDLER=" + fn.getHandler());
-        env.add("AWS_DEFAULT_REGION=us-east-1");
-        env.add("AWS_REGION=us-east-1");
+        env.add("AWS_LAMBDA_LOG_GROUP_NAME=" + cwLogGroup);
+        env.add("AWS_LAMBDA_LOG_STREAM_NAME=" + cwLogStream);
+        if (fn.getHandler() != null && !fn.getHandler().isBlank()) {
+            env.add("_HANDLER=" + fn.getHandler());
+        }
+        env.add("AWS_DEFAULT_REGION=" + lambdaRegion);
+        env.add("AWS_REGION=" + lambdaRegion);
+        env.add("AWS_ACCESS_KEY_ID=test");
+        env.add("AWS_SECRET_ACCESS_KEY=test");
+        env.add("AWS_SESSION_TOKEN=test");
+        env.add("FLOCI_HOSTNAME=" + flociHostname);
+        env.add("FLOCI_ENDPOINT=" + flociEndpoint);
+        env.add("AWS_ENDPOINT_URL=" + flociEndpoint);
         if (fn.getEnvironment() != null) {
             fn.getEnvironment().forEach((k, v) -> env.add(k + "=" + v));
         }
 
-        // Build host config — memory limit only, no bind mount
-        // (code is copied in via Docker API tar-copy after container creation)
-        HostConfig hostConfig = HostConfig.newHostConfig()
-                .withMemory(fn.getMemorySize() * 1024 * 1024L);
-
-        // Attach to a specific Docker network if configured
-        config.services().lambda().dockerNetwork()
-                .or(() -> config.services().dockerNetwork())
-                .ifPresent(network -> {
-                    if (!network.isBlank()) {
-                        hostConfig.withNetworkMode(network);
-                        LOG.debugv("Attaching Lambda container to network: {0}", network);
-                    }
-                });
-
-        // Give the container a human-readable name so it is identifiable in Docker Desktop
-        String shortId = java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 8);
-        String containerName = "floci-" + fn.getFunctionName() + "-" + shortId;
-
-        // Create container — CMD must be the handler name (Lambda entrypoint requires it as first arg)
-        CreateContainerCmd createCmd = dockerClient.createContainerCmd(image)
+        ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image)
                 .withName(containerName)
                 .withEnv(env)
-                .withCmd(fn.getHandler())
-                .withHostConfig(hostConfig);
+                .withMemoryMb(fn.getMemorySize())
+                .withDockerNetwork(config.services().lambda().dockerNetwork())
+                .withHostDockerInternalOnLinux()
+                .withLogRotation();
 
-        CreateContainerResponse container = createCmd.exec();
-        String containerId = container.getId();
+        specBuilder.withEmbeddedDns();
+
+        if (fn.isHotReload()) {
+            specBuilder.withBind(fn.getHotReloadHostPath(), TASK_DIR);
+        }
+
+        // For Image package type use ImageConfig.Command/EntryPoint/WorkingDirectory if set, otherwise fall back to Handler (Zip-style)
+        if ("Image".equals(fn.getPackageType())) {
+            if (fn.getImageConfigEntryPoint() != null && !fn.getImageConfigEntryPoint().isEmpty()) {
+                specBuilder.withEntrypoint(fn.getImageConfigEntryPoint());
+            }
+            if (fn.getImageConfigCommand() != null && !fn.getImageConfigCommand().isEmpty()) {
+                specBuilder.withCmd(fn.getImageConfigCommand());
+            }
+            if (fn.getImageConfigWorkingDirectory() != null && !fn.getImageConfigWorkingDirectory().isBlank()) {
+                specBuilder.withWorkingDir(fn.getImageConfigWorkingDirectory());
+            }
+        } else if (fn.getHandler() != null && !fn.getHandler().isBlank()) {
+            specBuilder.withCmd(fn.getHandler());
+        }
+
+        ContainerSpec spec = specBuilder.build();
+
+        // Create container without starting — provided.* runtimes exec
+        // /var/runtime/bootstrap on start, so code must be copied first.
+        String containerId = lifecycleManager.create(spec);
         LOG.infov("Created container {0} for function {1}", containerId, fn.getFunctionName());
 
-        // Copy code into container via Docker API tar stream (works inside Docker too)
-        if (fn.getCodeLocalPath() != null) {
+        // Copy code into container via Docker API tar stream (works inside Docker too).
+        // Hot-reload functions skip the tar-copy — the bind-mount already wires the host path.
+        DockerClient dockerClient = lifecycleManager.getDockerClient();
+        if (!fn.isHotReload() && fn.getCodeLocalPath() != null) {
             Path codePath = Path.of(fn.getCodeLocalPath());
-            try (java.io.PipedOutputStream pos = new java.io.PipedOutputStream();
-                 java.io.PipedInputStream pis = new java.io.PipedInputStream(pos)) {
-                
-                // Use a separate thread to feed the pipe to avoid deadlock
-                new Thread(() -> {
-                    try (pos) {
-                        createTar(codePath, pos);
-                    } catch (IOException e) {
-                        LOG.errorv("Failed to stream tar for function {0}: {1}", fn.getFunctionName(), e.getMessage());
-                    }
-                }, "tar-streamer-" + fn.getFunctionName()).start();
 
-                dockerClient.copyArchiveToContainerCmd(containerId)
-                        .withRemotePath(TASK_DIR)
-                        .withTarInputStream(pis)
-                        .exec();
-                LOG.debugv("Copied code into container {0} at {1}", containerId, TASK_DIR);
-            } catch (java.nio.file.NoSuchFileException e) {
-                // Race condition: code directory deleted between the pre-launch check and the copy
-                // (e.g. function deleted while the image was being pulled).
-                // Abort cleanly — remove the container and stop the Runtime API server.
-                LOG.debugv("Code directory removed during image pull for function {0}, aborting launch",
-                        fn.getFunctionName());
-                try { dockerClient.removeContainerCmd(containerId).withForce(true).exec(); } catch (Exception ignored) {}
-                runtimeApiServer.stop();
-                throw new RuntimeException("Function code was deleted during container launch: "
-                        + fn.getFunctionName());
-            } catch (Exception e) {
-                LOG.warnv("Failed to copy code into container {0}: {1}", containerId, e.getMessage());
+            // 1. Always copy all code to /var/task (TASK_DIR)
+            copyDirToContainer(dockerClient, containerId, codePath, TASK_DIR, fn.getFunctionName());
+
+            // 2. For provided runtimes, also copy the 'bootstrap' file to /var/runtime (RUNTIME_DIR)
+            if (isProvidedRuntime(fn.getRuntime())) {
+                Path bootstrapPath = codePath.resolve("bootstrap");
+                if (Files.exists(bootstrapPath)) {
+                    copyFileToContainer(dockerClient, containerId, bootstrapPath, RUNTIME_DIR, "bootstrap", fn.getFunctionName());
+                } else {
+                    LOG.warnv("Provided runtime function {0} is missing 'bootstrap' file in {1}",
+                            fn.getFunctionName(), fn.getCodeLocalPath());
+                }
             }
         }
 
-        // Start container
-        dockerClient.startContainerCmd(containerId).exec();
-        LOG.infov("Started container {0}", containerId);
+        // Now start the container with code in place
+        lifecycleManager.startCreated(containerId, spec);
 
-        ContainerHandle handle = new ContainerHandle(containerId, fn.getFunctionName(), runtimeApiServer, ContainerState.WARM);
+        ContainerHandle handle = new ContainerHandle(containerId, fn.getFunctionName(), runtimeApiServer, ContainerState.WARM, fn.isHotReload());
 
-        // Determine CloudWatch Logs destination for this container instance
-        String cwLogGroup = "/aws/lambda/" + fn.getFunctionName();
-        String region = extractRegionFromArn(fn.getFunctionArn());
-        String cwLogStream = LOG_STREAM_DATE_FMT.format(LocalDate.now()) + "/[$LATEST]" + shortId;
-        ensureLogGroupAndStream(cwLogGroup, cwLogStream, region);
-
-        // Stream container stdout/stderr to the emulator logger AND to CloudWatch Logs
-        try {
-            ResultCallback.Adapter<Frame> logCallback = dockerClient.logContainerCmd(containerId)
-                    .withStdOut(true)
-                    .withStdErr(true)
-                    .withFollowStream(true)
-                    .withTimestamps(false)
-                    .exec(new ResultCallback.Adapter<>() {
-                        @Override
-                        public void onNext(Frame frame) {
-                            String line = new String(frame.getPayload(), StandardCharsets.UTF_8).stripTrailing();
-                            if (!line.isEmpty()) {
-                                LOG.infov("[lambda:{0}] {1}", fn.getFunctionName(), line);
-                                forwardToCloudWatchLogs(cwLogGroup, cwLogStream, region, line);
-                            }
-                        }
-                    });
-            handle.setLogStream(logCallback);
-        } catch (Exception e) {
-            LOG.warnv("Could not attach log stream for container {0}: {1}", containerId, e.getMessage());
-        }
+        // Attach log streaming
+        Closeable logHandle = logStreamer.attach(
+                containerId, cwLogGroup, cwLogStream, lambdaRegion, "lambda:" + fn.getFunctionName());
+        handle.setLogStream(logHandle);
 
         return handle;
     }
@@ -222,122 +253,114 @@ public class ContainerLauncher {
         LOG.infov("Stopping container {0}", handle.getContainerId());
         handle.setState(ContainerState.STOPPED);
 
-        // Close log stream first so the streaming thread exits cleanly
-        if (handle.getLogStream() != null) {
-            try { handle.getLogStream().close(); } catch (Exception ignored) {}
-        }
-
-        try {
-            dockerClient.stopContainerCmd(handle.getContainerId()).withTimeout(5).exec();
-        } catch (Exception e) {
-            LOG.warnv("Error stopping container {0}: {1}", handle.getContainerId(), e.getMessage());
-        }
-
-        try {
-            dockerClient.removeContainerCmd(handle.getContainerId()).withForce(true).exec();
-        } catch (Exception e) {
-            LOG.warnv("Error removing container {0}: {1}", handle.getContainerId(), e.getMessage());
-        }
-
         handle.getRuntimeApiServer().stop();
-    }
-
-    private void ensureLogGroupAndStream(String logGroup, String logStream, String region) {
-        try {
-            cloudWatchLogsService.createLogGroup(logGroup, null, null, region);
-        } catch (AwsException ignored) {
-            // Already exists — that's fine
-        } catch (Exception e) {
-            LOG.warnv("Could not create CW log group {0}: {1}", logGroup, e.getMessage());
-        }
-        try {
-            cloudWatchLogsService.createLogStream(logGroup, logStream, region);
-        } catch (AwsException ignored) {
-            // Already exists — that's fine
-        } catch (Exception e) {
-            LOG.warnv("Could not create CW log stream {0}/{1}: {2}", logGroup, logStream, e.getMessage());
-        }
-    }
-
-    private void forwardToCloudWatchLogs(String logGroup, String logStream, String region, String line) {
-        try {
-            Map<String, Object> event = new HashMap<>();
-            event.put("timestamp", System.currentTimeMillis());
-            event.put("message", line);
-            cloudWatchLogsService.putLogEvents(logGroup, logStream, List.of(event), region);
-        } catch (Exception e) {
-            LOG.debugv("Could not forward log line to CloudWatch Logs: {0}", e.getMessage());
-        }
-    }
-
-    private static String extractRegionFromArn(String arn) {
-        if (arn == null) {
-            return "us-east-1";
-        }
-        String[] parts = arn.split(":");
-        return parts.length >= 4 && !parts[3].isEmpty() ? parts[3] : "us-east-1";
+        lifecycleManager.stopAndRemove(handle.getContainerId(), handle.getLogStream());
     }
 
     /**
-     * Creates a minimal POSIX TAR archive from all files in {@code sourceDir}.
-     * Streams content to the OutputStream to avoid loading entire files into memory.
+     * Probes whether the handle's underlying container is still running.
+     *
+     * @param handle the warm-pool handle to probe
+     * @return true if the container is still running
      */
-    private static void createTar(Path sourceDir, java.io.OutputStream out) throws IOException {
-        try (var stream = Files.walk(sourceDir)) {
-            for (Path path : (Iterable<Path>) stream::iterator) {
-                if (Files.isDirectory(path)) continue;
+    public boolean isAlive(ContainerHandle handle) {
+        return lifecycleManager.isContainerRunning(handle.getContainerId());
+    }
 
-                String entryName = sourceDir.relativize(path).toString();
-                long size = Files.size(path);
+    private void copyDirToContainer(DockerClient dockerClient, String containerId,
+                                    Path sourceDir, String remotePath, String functionName) {
+        try (java.io.PipedOutputStream pos = new java.io.PipedOutputStream();
+             java.io.PipedInputStream pis = new java.io.PipedInputStream(pos)) {
 
-                writeTarHeader(out, entryName, size);
-                try (java.io.InputStream fis = Files.newInputStream(path)) {
-                    fis.transferTo(out);
+            new Thread(() -> {
+                try (pos) {
+                    createTarFromDir(sourceDir, pos);
+                } catch (IOException e) {
+                    LOG.errorv("Failed to stream tar for function {0}: {1}", functionName, e.getMessage());
                 }
-                
-                // Pad data to 512-byte boundary
-                int pad = (int) ((512 - (size % 512)) % 512);
-                if (pad > 0) out.write(new byte[pad]);
+            }, "tar-streamer-dir-" + functionName).start();
+
+            dockerClient.copyArchiveToContainerCmd(containerId)
+                    .withRemotePath(remotePath)
+                    .withTarInputStream(pis)
+                    .exec();
+            LOG.debugv("Copied directory {0} into container {1} at {2}", sourceDir, containerId, remotePath);
+        } catch (Exception e) {
+            LOG.warnv("Failed to copy directory {0} into container {1}: {2}", sourceDir, containerId, e.getMessage());
+        }
+    }
+
+    private void copyFileToContainer(DockerClient dockerClient, String containerId,
+                                     Path sourceFile, String remotePath, String entryName, String functionName) {
+        try (java.io.PipedOutputStream pos = new java.io.PipedOutputStream();
+             java.io.PipedInputStream pis = new java.io.PipedInputStream(pos)) {
+
+            new Thread(() -> {
+                try (TarArchiveOutputStream tar = newTarStream(pos)) {
+                    TarArchiveEntry entry = new TarArchiveEntry(entryName);
+                    entry.setSize(Files.size(sourceFile));
+                    entry.setMode(0755);
+                    tar.putArchiveEntry(entry);
+                    try (var fis = Files.newInputStream(sourceFile)) {
+                        fis.transferTo(tar);
+                    }
+                    tar.closeArchiveEntry();
+                } catch (IOException e) {
+                    LOG.errorv("Failed to stream file tar for function {0}: {1}", functionName, e.getMessage());
+                }
+            }, "tar-streamer-file-" + functionName).start();
+
+            dockerClient.copyArchiveToContainerCmd(containerId)
+                    .withRemotePath(remotePath)
+                    .withTarInputStream(pis)
+                    .exec();
+            LOG.debugv("Copied file {0} as {1} into container {2} at {3}", sourceFile, entryName, containerId, remotePath);
+        } catch (Exception e) {
+            LOG.warnv("Failed to copy file {0} into container {1}: {2}", sourceFile, containerId, e.getMessage());
+        }
+    }
+
+    private static boolean isProvidedRuntime(String runtime) {
+        return runtime != null && runtime.startsWith("provided");
+    }
+
+    private static String extractRegionFromArn(String arn, String defaultRegion) {
+        if (arn == null) {
+            return defaultRegion;
+        }
+        String[] parts = arn.split(":");
+        return parts.length >= 4 && !parts[3].isEmpty() ? parts[3] : defaultRegion;
+    }
+
+    /**
+     * Creates a TAR archive from all files in {@code sourceDir}, streaming to {@code out}.
+     * Uses GNU long-name extension (via Commons Compress) so file paths of any length
+     * are preserved without truncation.
+     */
+    private static void createTarFromDir(Path sourceDir, OutputStream out) throws IOException {
+        try (TarArchiveOutputStream tar = newTarStream(out);
+             var stream = Files.walk(sourceDir)) {
+            for (Path path : (Iterable<Path>) stream::iterator) {
+                if (Files.isDirectory(path)) {
+                    continue;
+                }
+                String entryName = sourceDir.relativize(path).toString();
+                TarArchiveEntry entry = new TarArchiveEntry(entryName);
+                entry.setSize(Files.size(path));
+                entry.setMode(0755);
+                tar.putArchiveEntry(entry);
+                try (var fis = Files.newInputStream(path)) {
+                    fis.transferTo(tar);
+                }
+                tar.closeArchiveEntry();
             }
         }
-
-        // End-of-archive: two 512-byte zero blocks
-        out.write(new byte[1024]);
     }
 
-    private static void writeTarHeader(java.io.OutputStream out, String name, long size) throws IOException {
-        byte[] header = new byte[512];
-
-        // Filename (max 100 bytes)
-        byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
-        System.arraycopy(nameBytes, 0, header, 0, Math.min(nameBytes.length, 99));
-
-        // File mode: 0000755
-        putOctal(header, 100, 8, 0755);
-        // UID / GID: 0
-        putOctal(header, 108, 8, 0);
-        putOctal(header, 116, 8, 0);
-        // File size
-        putOctal(header, 124, 12, size);
-        // Modification time
-        putOctal(header, 136, 12, System.currentTimeMillis() / 1000);
-        // Type flag: '0' = regular file
-        header[156] = '0';
-
-        // Checksum: fill checksum field with spaces first, then compute
-        for (int i = 148; i < 156; i++) header[i] = ' ';
-        int checksum = 0;
-        for (byte b : header) checksum += b & 0xFF;
-        putOctal(header, 148, 8, checksum);
-
-        out.write(header);
-    }
-
-    /** Writes {@code value} as a null-terminated octal string into {@code buf[offset..offset+length)}. */
-    private static void putOctal(byte[] buf, int offset, int length, long value) {
-        String octal = String.format("%0" + (length - 1) + "o", value);
-        byte[] bytes = octal.getBytes(StandardCharsets.US_ASCII);
-        System.arraycopy(bytes, 0, buf, offset, Math.min(bytes.length, length - 1));
-        buf[offset + length - 1] = 0;
+    private static TarArchiveOutputStream newTarStream(OutputStream out) {
+        TarArchiveOutputStream tar = new TarArchiveOutputStream(out);
+        tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_GNU);
+        tar.setBigNumberMode(TarArchiveOutputStream.BIGNUMBER_STAR);
+        return tar;
     }
 }

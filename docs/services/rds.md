@@ -41,12 +41,12 @@ floci:
 
 ### Docker Compose
 
-RDS requires the Docker socket and port range exposure:
+RDS requires the Docker socket and port range exposure. For private registry authentication and other Docker settings see [Docker Configuration](../configuration/docker.md).
 
 ```yaml
 services:
   floci:
-    image: hectorvent/floci:latest
+    image: floci/floci:latest
     ports:
       - "4566:4566"
       - "7001-7099:7001-7099"   # RDS proxy ports
@@ -60,7 +60,7 @@ services:
 ## Examples
 
 ```bash
-export AWS_ENDPOINT=http://localhost:4566
+export AWS_ENDPOINT_URL=http://localhost:4566
 
 # Create a PostgreSQL instance
 aws rds create-db-instance \
@@ -70,13 +70,13 @@ aws rds create-db-instance \
   --master-username admin \
   --master-user-password secret123 \
   --allocated-storage 20 \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Get connection details
 aws rds describe-db-instances \
   --db-instance-identifier mypostgres \
   --query 'DBInstances[0].Endpoint' \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Connect with psql (use the port returned above)
 psql -h localhost -p 7001 -U admin
@@ -89,7 +89,7 @@ aws rds create-db-instance \
   --master-username root \
   --master-user-password secret123 \
   --allocated-storage 20 \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Connect with mysql client
 mysql -h 127.0.0.1 -P 7002 -u root -psecret123
@@ -104,3 +104,27 @@ mysql -h 127.0.0.1 -P 7002 -u root -psecret123
 | `mariadb` | `mariadb:11` |
 
 Override the image per-instance with the `--engine-version` flag or globally via environment variables.
+
+## Persistence
+
+By default, each DB instance or cluster gets its own named Docker volume (`floci-rds-<id>`). The volume is created when the instance is created and removed when the instance is deleted.
+
+Set `FLOCI_STORAGE_SERVICES_RDS_MODE=memory` (or set the global `FLOCI_STORAGE_MODE=memory`) to disable volume creation entirely — DB containers become ephemeral and data is lost on restart. This is the recommended setting for CI.
+
+```bash
+# CI — no volumes, fastest startup
+FLOCI_STORAGE_SERVICES_RDS_MODE=memory
+
+# Local dev — persist DB data across Floci restarts
+FLOCI_STORAGE_SERVICES_RDS_MODE=hybrid
+FLOCI_STORAGE_HOST_PERSISTENT_PATH=/absolute/host/path/data
+```
+
+!!! note "Docker Desktop on macOS"
+    Floci uses named Docker volumes (not bind mounts) for RDS persistence. This works correctly on Docker Desktop for macOS where bind-mounting paths inside the Floci container is not supported.
+
+## Authentication
+
+The RDS auth proxy validates the master username and password at the proxy layer. All other database users are passed through directly to the backend engine — create them with standard SQL (`CREATE USER`) and connect as normal.
+
+IAM database authentication is also supported. Set `--enable-iam-database-authentication` at instance creation time and use `aws rds generate-db-auth-token` to obtain a token.

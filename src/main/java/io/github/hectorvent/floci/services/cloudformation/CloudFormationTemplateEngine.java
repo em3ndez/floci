@@ -3,12 +3,14 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.TextNode;
+import io.github.hectorvent.floci.core.common.AwsException;
 import org.jboss.logging.Logger;
 
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.function.Function;
 
 /**
  * Resolves CloudFormation intrinsic functions and pseudo-parameters in template nodes.
@@ -27,14 +29,18 @@ public class CloudFormationTemplateEngine {
     private final Map<String, String> physicalIds;
     private final Map<String, Map<String, String>> resourceAttributes;
     private final Map<String, Boolean> conditions;
+    private final Map<String, JsonNode> mappings;
     private final ObjectMapper objectMapper;
+    private final Function<String, String> importValueResolver;
 
     CloudFormationTemplateEngine(String accountId, String region, String stackName, String stackId,
                                  Map<String, String> parameters,
                                  Map<String, String> physicalIds,
                                  Map<String, Map<String, String>> resourceAttributes,
                                  Map<String, Boolean> conditions,
-                                 ObjectMapper objectMapper) {
+                                 Map<String, JsonNode> mappings,
+                                 ObjectMapper objectMapper,
+                                 Function<String, String> importValueResolver) {
         this.accountId = accountId;
         this.region = region;
         this.stackName = stackName;
@@ -43,7 +49,9 @@ public class CloudFormationTemplateEngine {
         this.physicalIds = physicalIds;
         this.resourceAttributes = resourceAttributes;
         this.conditions = conditions;
+        this.mappings = mappings;
         this.objectMapper = objectMapper;
+        this.importValueResolver = importValueResolver;
     }
 
     public String resolve(JsonNode node) {
@@ -85,7 +93,10 @@ public class CloudFormationTemplateEngine {
                 return resolveGetAtt(node.get("Fn::GetAtt"));
             }
             if (node.has("Fn::ImportValue")) {
-                return resolve(node.get("Fn::ImportValue"));
+                return resolveImportValue(node.get("Fn::ImportValue"));
+            }
+            if (node.has("Fn::FindInMap")) {
+                return resolveFindInMap(node.get("Fn::FindInMap"));
             }
         }
         return node.asText();
@@ -244,5 +255,37 @@ public class CloudFormationTemplateEngine {
         }
         LOG.debugv("Unresolved GetAtt: {0}.{1}", logicalId, attrName);
         return logicalId + "." + attrName;
+    }
+
+    private String resolveFindInMap(JsonNode node) {
+        if (node.isArray()) {
+            String mapName = resolve(node.get(0));
+            String topLvlName = resolve(node.get(1));
+            String secondLvlName = resolve(node.get(2));
+
+            JsonNode map = mappings.get(mapName);
+            if (map != null && map.isObject()) {
+                JsonNode topLvl = map.get(topLvlName);
+                if (topLvl != null && topLvl.isObject()) {
+                    JsonNode secondLvl = topLvl.get(secondLvlName);
+                    if (secondLvl != null) {
+                        return resolve(secondLvl);
+                    }
+                }
+            }
+        }
+        return "";
+    }
+
+    private String resolveImportValue(JsonNode node) {
+        String exportName = resolve(node);
+        if (importValueResolver != null) {
+            String value = importValueResolver.apply(exportName);
+            if (value != null) {
+                return value;
+            }
+        }
+        LOG.warnv("Unresolved Fn::ImportValue: {0}", exportName);
+        throw new AwsException("ValidationError", "No export named " + exportName + " found", 400);
     }
 }

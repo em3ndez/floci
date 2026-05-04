@@ -33,12 +33,12 @@ floci:
 
 ### Docker Compose
 
-ElastiCache requires the Docker socket and port range exposure:
+ElastiCache requires the Docker socket and port range exposure. For private registry authentication and other Docker settings see [Docker Configuration](../configuration/docker.md).
 
 ```yaml
 services:
   floci:
-    image: hectorvent/floci:latest
+    image: floci/floci:latest
     ports:
       - "4566:4566"
       - "6379-6399:6379-6399"   # ElastiCache proxy ports
@@ -51,20 +51,20 @@ services:
 ## Examples
 
 ```bash
-export AWS_ENDPOINT=http://localhost:4566
+export AWS_ENDPOINT_URL=http://localhost:4566
 
 # Create a replication group (starts a Valkey container)
 aws elasticache create-replication-group \
   --replication-group-id my-cache \
   --replication-group-description "Dev cache" \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 
 # Get the connection port
 PORT=$(aws elasticache describe-replication-groups \
   --replication-group-id my-cache \
   --query 'ReplicationGroups[0].NodeGroups[0].PrimaryEndpoint.Port' \
   --output text \
-  --endpoint-url $AWS_ENDPOINT)
+  --endpoint-url $AWS_ENDPOINT_URL)
 
 # Connect with redis-cli
 redis-cli -h localhost -p $PORT ping
@@ -76,7 +76,7 @@ redis-cli -h localhost -p $PORT get mykey
 # Delete the cluster
 aws elasticache delete-replication-group \
   --replication-group-id my-cache \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 ```
 
 ## IAM Authentication
@@ -91,5 +91,5 @@ aws elasticache create-user \
   --engine redis \
   --access-string "on ~* +@all" \
   --no-no-password-required \
-  --endpoint-url $AWS_ENDPOINT
+  --endpoint-url $AWS_ENDPOINT_URL
 ```

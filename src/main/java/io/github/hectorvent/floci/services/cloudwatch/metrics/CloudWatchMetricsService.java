@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -100,6 +101,31 @@ public class CloudWatchMetricsService {
     public record Datapoint(Instant timestamp, double sampleCount, double sum,
                              double average, double minimum, double maximum, String unit) {}
 
+    public record MetricStat(
+            String namespace,
+            String metricName,
+            List<Dimension> dimensions,
+            int period,
+            String stat,
+            String unit
+    ) {}
+
+    public record MetricDataQuery(
+            String id,
+            MetricStat metricStat,
+            String expression,
+            String label,
+            boolean returnData
+    ) {}
+
+    public record MetricDataResult(
+            String id,
+            String label,
+            List<Instant> timestamps,
+            List<Double> values,
+            String statusCode
+    ) {}
+
     public List<Datapoint> getMetricStatistics(String namespace, String metricName,
                                                 List<Dimension> dimensions,
                                                 Instant startTime, Instant endTime,
@@ -159,13 +185,72 @@ public class CloudWatchMetricsService {
         return result;
     }
 
+    public List<MetricDataResult> getMetricData(
+            List<MetricDataQuery> queries,
+            Instant startTime,
+            Instant endTime,
+            String region) {
+
+        List<MetricDataResult> results = new ArrayList<>();
+
+        for (MetricDataQuery query : queries) {
+            if (!query.returnData()) {
+                continue;
+            }
+            if (query.metricStat() != null) {
+                MetricStat stat = query.metricStat();
+                int period = stat.period() > 0 ? stat.period() : 60;
+
+                List<Datapoint> datapoints = getMetricStatistics(
+                        stat.namespace(), stat.metricName(), stat.dimensions(),
+                        startTime, endTime, period,
+                        List.of(stat.stat()), stat.unit(), region);
+
+                List<Instant> timestamps = new ArrayList<>();
+                List<Double> values = new ArrayList<>();
+                for (Datapoint dp : datapoints) {
+                    timestamps.add(dp.timestamp());
+                    values.add(resolveStatValue(dp, stat.stat()));
+                }
+
+                String label = query.label() != null ? query.label() : stat.metricName();
+                results.add(new MetricDataResult(query.id(), label, timestamps, values, "Complete"));
+            }
+            // Expression-based queries are out of scope for this implementation
+        }
+        return results;
+    }
+
+    /** Shared with {@link AlarmEvaluator}, which resolves the same statistic against
+     * freshly-fetched datapoints when evaluating an alarm's threshold. */
+    public static double resolveStatValue(Datapoint dp, String stat) {
+        return switch (stat) {
+            case "Average" -> dp.average();
+            case "Sum" -> dp.sum();
+            case "Minimum" -> dp.minimum();
+            case "Maximum" -> dp.maximum();
+            case "SampleCount" -> dp.sampleCount();
+            default -> {
+                if (stat.startsWith("p")) yield dp.maximum();
+                else yield dp.average();
+            }
+        };
+    }
+
     public void putMetricAlarm(MetricAlarm alarm, String region) {
         if (alarm.getAlarmArn() == null) {
             alarm.setAlarmArn(regionResolver.buildArn("cloudwatch", region, "alarm:" + alarm.getAlarmName()));
         }
+        alarm.setRegion(region);
         alarm.setAlarmConfigurationUpdatedTimestamp(Instant.now().getEpochSecond());
         alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
         LOG.infov("PutMetricAlarm: {0} in {1}", alarm.getAlarmName(), region);
+    }
+
+    /** Every stored alarm, across all regions. Used by the background {@link AlarmEvaluator}
+     * tick, which has no per-request region to scope a lookup to. */
+    public List<MetricAlarm> allAlarms() {
+        return alarmStore.scan(k -> true);
     }
 
     public List<MetricAlarm> describeAlarms(List<String> alarmNames, String alarmNamePrefix, String region) {
@@ -191,7 +276,7 @@ public class CloudWatchMetricsService {
     public void setAlarmState(String alarmName, String stateValue, String stateReason, String stateReasonData, String region) {
         String key = region + "::" + alarmName;
         MetricAlarm alarm = alarmStore.get(key)
-                .orElseThrow(() -> new RuntimeException("Alarm not found: " + alarmName));
+                .orElseThrow(() -> new AwsException("ResourceNotFound", "Alarm not found: " + alarmName, 404));
 
         alarm.setStateValue(stateValue);
         alarm.setStateReason(stateReason);
@@ -200,6 +285,37 @@ public class CloudWatchMetricsService {
 
         alarmStore.put(key, alarm);
         LOG.infov("SetAlarmState: {0} -> {1}", alarmName, stateValue);
+    }
+
+    public Map<String, String> listTagsForResource(String resourceArn, String region) {
+        return alarmStore.scan(k -> k.startsWith(region + "::"))
+                .stream()
+                .filter(a -> resourceArn.equals(a.getAlarmArn()))
+                .findFirst()
+                .map(MetricAlarm::getTags)
+                .orElse(Map.of());
+    }
+
+    public void tagResource(String resourceArn, Map<String, String> tags, String region) {
+        alarmStore.scan(k -> k.startsWith(region + "::"))
+                .stream()
+                .filter(a -> resourceArn.equals(a.getAlarmArn()))
+                .findFirst()
+                .ifPresent(alarm -> {
+                    alarm.getTags().putAll(tags);
+                    alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
+                });
+    }
+
+    public void untagResource(String resourceArn, List<String> tagKeys, String region) {
+        alarmStore.scan(k -> k.startsWith(region + "::"))
+                .stream()
+                .filter(a -> resourceArn.equals(a.getAlarmArn()))
+                .findFirst()
+                .ifPresent(alarm -> {
+                    tagKeys.forEach(alarm.getTags()::remove);
+                    alarmStore.put(region + "::" + alarm.getAlarmName(), alarm);
+                });
     }
 
     // ──────────────────────────── Helpers ────────────────────────────

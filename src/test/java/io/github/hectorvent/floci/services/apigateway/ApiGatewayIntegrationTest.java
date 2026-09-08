@@ -35,6 +35,7 @@ class ApiGatewayIntegrationTest {
                 .body("id", notNullValue())
                 .body("name", equalTo("test-api"))
                 .body("description", equalTo("Integration test API"))
+                .body("apiStatus", equalTo("AVAILABLE"))
                 .extract().path("id");
     }
 
@@ -45,7 +46,8 @@ class ApiGatewayIntegrationTest {
                 .then()
                 .statusCode(200)
                 .body("id", equalTo(apiId))
-                .body("name", equalTo("test-api"));
+                .body("name", equalTo("test-api"))
+                .body("apiStatus", equalTo("AVAILABLE"));
     }
 
     @Test @Order(3)
@@ -218,9 +220,19 @@ class ApiGatewayIntegrationTest {
                 .body("item.id", hasItem(deploymentId));
     }
 
+    @Test @Order(18)
+    void getDeployment() {
+        given()
+                .when().get("/restapis/" + apiId + "/deployments/" + deploymentId)
+                .then()
+                .statusCode(200)
+                .body("id", equalTo(deploymentId))
+                .body("description", equalTo("v1"));
+    }
+
     // ──────────────────────────── Stages ────────────────────────────
 
-    @Test @Order(18)
+    @Test @Order(19)
     void createStage() {
         given()
                 .contentType(ContentType.JSON)
@@ -232,7 +244,7 @@ class ApiGatewayIntegrationTest {
                 .body("deploymentId", equalTo(deploymentId));
     }
 
-    @Test @Order(19)
+    @Test @Order(20)
     void getStage() {
         given()
                 .when().get("/restapis/" + apiId + "/stages/prod")
@@ -241,7 +253,7 @@ class ApiGatewayIntegrationTest {
                 .body("stageName", equalTo("prod"));
     }
 
-    @Test @Order(20)
+    @Test @Order(21)
     void listStages() {
         given()
                 .when().get("/restapis/" + apiId + "/stages")
@@ -250,7 +262,7 @@ class ApiGatewayIntegrationTest {
                 .body("item.stageName", hasItem("prod"));
     }
 
-    @Test @Order(21)
+    @Test @Order(22)
     void updateStage() {
         String patch = """
                 {"patchOperations":[{"op":"replace","path":"/description","value":"Production"}]}
@@ -266,7 +278,7 @@ class ApiGatewayIntegrationTest {
 
     // ──────────────────────────── Tags ────────────────────────────
 
-    @Test @Order(22)
+    @Test @Order(23)
     void tagResource() {
         String arn = "arn:aws:apigateway:us-east-1::/restapis/" + apiId;
         given()
@@ -278,6 +290,18 @@ class ApiGatewayIntegrationTest {
     }
 
     @Test @Order(23)
+    void tagResourcePostReturns405() {
+        // AWS API Gateway only defines PUT for TagResource; POST is not in the spec.
+        String arn = "arn:aws:apigateway:us-east-1::/restapis/" + apiId;
+        given()
+                .contentType(ContentType.JSON)
+                .body("{\"tags\":{\"env\":\"test\"}}")
+                .when().post("/tags/" + arn)
+                .then()
+                .statusCode(405);
+    }
+
+    @Test @Order(24)
     void getTags() {
         String arn = "arn:aws:apigateway:us-east-1::/restapis/" + apiId;
         given()
@@ -287,7 +311,7 @@ class ApiGatewayIntegrationTest {
                 .body("tags.env", equalTo("test"));
     }
 
-    @Test @Order(24)
+    @Test @Order(25)
     void untagResource() {
         String arn = "arn:aws:apigateway:us-east-1::/restapis/" + apiId;
         given()
@@ -305,7 +329,7 @@ class ApiGatewayIntegrationTest {
 
     // ──────────────────────────── Cleanup ────────────────────────────
 
-    @Test @Order(25)
+    @Test @Order(26)
     void deleteStage() {
         given()
                 .when().delete("/restapis/" + apiId + "/stages/prod")
@@ -313,15 +337,29 @@ class ApiGatewayIntegrationTest {
                 .statusCode(202);
     }
 
-    @Test @Order(26)
+    @Test @Order(27)
+    void deleteDeployment() {
+        given()
+                .when().delete("/restapis/" + apiId + "/deployments/" + deploymentId)
+                .then()
+                .statusCode(202);
+
+        given()
+                .when().get("/restapis/" + apiId + "/deployments/" + deploymentId)
+                .then()
+                .statusCode(404)
+                .body("message", notNullValue());
+    }
+
+    @Test @Order(28)
     void deleteResource() {
         given()
                 .when().delete("/restapis/" + apiId + "/resources/" + resourceId)
                 .then()
-                .statusCode(204);
+                .statusCode(202);
     }
 
-    @Test @Order(27)
+    @Test @Order(29)
     void deleteRestApi() {
         given()
                 .when().delete("/restapis/" + apiId)
@@ -329,11 +367,146 @@ class ApiGatewayIntegrationTest {
                 .statusCode(202);
     }
 
-    @Test @Order(28)
+    @Test @Order(30)
     void getDeletedRestApiReturns404() {
         given()
                 .when().get("/restapis/" + apiId)
                 .then()
                 .statusCode(404);
+    }
+
+    // ──────────────────────────── _custom_id_ tag (deprecated) ────────────────────────────
+
+    @Test @Order(50)
+    void createRestApi_customIdTag_usesTagValueAsApiId() {
+        String body = """
+                {"name":"custom-id-api","tags":{"_custom_id_":"MYCUSTOMNAME","env":"test"}}
+                """;
+        given()
+                .contentType(ContentType.JSON)
+                .body(body)
+                .when().post("/restapis")
+                .then()
+                .statusCode(201)
+                .body("id", equalTo("MYCUSTOMNAME"))
+                // The override key is consumed, not persisted; unrelated tags survive.
+                .body("tags._custom_id_", nullValue())
+                .body("tags.env", equalTo("test"));
+    }
+
+    @Test @Order(51)
+    void getRestApi_customId_resolvesById() {
+        given()
+                .when().get("/restapis/MYCUSTOMNAME")
+                .then()
+                .statusCode(200)
+                .body("id", equalTo("MYCUSTOMNAME"))
+                .body("name", equalTo("custom-id-api"));
+    }
+
+    // ──────────────────────────── floci:override-id tag ────────────────────────────
+
+    @Test @Order(52)
+    void createRestApi_flociOverrideIdTag_usesTagValueAsApiId() {
+        String body = """
+                {"name":"override-id-api","tags":{"floci:override-id":"MYOVERRIDEID"}}
+                """;
+        given()
+                .contentType(ContentType.JSON)
+                .body(body)
+                .when().post("/restapis")
+                .then()
+                .statusCode(201)
+                .body("id", equalTo("MYOVERRIDEID"))
+                .body("tags._custom_id_", nullValue())
+                .body("tags.'floci:override-id'", nullValue());
+    }
+
+    @Test @Order(53)
+    void createRestApi_bothOverrideKeys_prefersFlociOverrideId() {
+        String body = """
+                {"name":"both-keys-api","tags":{"floci:override-id":"WINNER","_custom_id_":"LOSER"}}
+                """;
+        given()
+                .contentType(ContentType.JSON)
+                .body(body)
+                .when().post("/restapis")
+                .then()
+                .statusCode(201)
+                .body("id", equalTo("WINNER"));
+    }
+
+    @Test @Order(54)
+    void createRestApi_blankOverrideId_isRejected() {
+        String body = """
+                {"name":"blank-override-api","tags":{"floci:override-id":"   "}}
+                """;
+        given()
+                .contentType(ContentType.JSON)
+                .body(body)
+                .when().post("/restapis")
+                .then()
+                .statusCode(400)
+                .body("message", containsString("must not be blank"));
+    }
+
+    @Test @Order(55)
+    void createRestApi_overrideIdWithPathSeparator_isRejected() {
+        String body = """
+                {"name":"bad-override-api","tags":{"floci:override-id":"has/slash"}}
+                """;
+        given()
+                .contentType(ContentType.JSON)
+                .body(body)
+                .when().post("/restapis")
+                .then()
+                .statusCode(400)
+                .body("message", containsString("unsupported characters"));
+    }
+
+    @Test @Order(56)
+    void createRestApi_duplicateOverrideId_isRejectedWithConflict() {
+        String body = """
+                {"name":"duplicate-override-api","tags":{"floci:override-id":"MYOVERRIDEID"}}
+                """;
+        given()
+                .contentType(ContentType.JSON)
+                .body(body)
+                .when().post("/restapis")
+                .then()
+                .statusCode(409)
+                .body("message", containsString("already exists"));
+        // The original API is untouched.
+        given()
+                .when().get("/restapis/MYOVERRIDEID")
+                .then()
+                .statusCode(200)
+                .body("name", equalTo("override-id-api"));
+    }
+
+    @Test @Order(57)
+    void getRestApi_flociOverrideId_resolvesById() {
+        given()
+                .when().get("/restapis/MYOVERRIDEID")
+                .then()
+                .statusCode(200)
+                .body("id", equalTo("MYOVERRIDEID"))
+                .body("name", equalTo("override-id-api"));
+    }
+
+    @Test @Order(58)
+    void deleteRestApi_customId() {
+        given()
+                .when().delete("/restapis/MYCUSTOMNAME")
+                .then()
+                .statusCode(202);
+        given()
+                .when().delete("/restapis/MYOVERRIDEID")
+                .then()
+                .statusCode(202);
+        given()
+                .when().delete("/restapis/WINNER")
+                .then()
+                .statusCode(202);
     }
 }

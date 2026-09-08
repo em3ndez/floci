@@ -1,5 +1,8 @@
 package io.github.hectorvent.floci.services.eventbridge.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -7,10 +10,12 @@ import java.util.HashMap;
 import java.util.Map;
 
 @RegisterForReflection
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class Rule {
 
     private String name;
     private String arn;
+    private String accountId;
     private String eventBusName;
     private String eventPattern;
     private String scheduleExpression;
@@ -27,6 +32,9 @@ public class Rule {
 
     public String getArn() { return arn; }
     public void setArn(String arn) { this.arn = arn; }
+
+    public String getAccountId() { return accountId; }
+    public void setAccountId(String accountId) { this.accountId = accountId; }
 
     public String getEventBusName() { return eventBusName; }
     public void setEventBusName(String eventBusName) { this.eventBusName = eventBusName; }
@@ -51,4 +59,9 @@ public class Rule {
 
     public Instant getCreatedAt() { return createdAt; }
     public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
+
+    @JsonIgnore
+    public String getRegion() {
+        return AwsArnUtils.regionOrDefault(arn, null);
+    }
 }

@@ -1,0 +1,320 @@
+package io.github.hectorvent.floci.core.common;
+
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class XmlParserTest {
+
+    // --- extractGroupsMulti: nested element resilience ---
+
+    @Test
+    void extractGroupsMultiSkipsNestedElementsAndParsesLeaves() {
+        String xml = """
+                <Root>
+                  <Group>
+                    <Id>g1</Id>
+                    <Arn>arn:example</Arn>
+                    <Event>event:one</Event>
+                    <Nested>
+                      <Deep>value</Deep>
+                    </Nested>
+                  </Group>
+                </Root>
+                """;
+
+        List<Map<String, List<String>>> groups = XmlParser.extractGroupsMulti(xml, "Group");
+
+        assertEquals(1, groups.size());
+        assertEquals(List.of("g1"), groups.get(0).get("Id"));
+        assertEquals(List.of("arn:example"), groups.get(0).get("Arn"));
+        assertEquals(List.of("event:one"), groups.get(0).get("Event"));
+        assertNull(groups.get(0).get("Nested"));
+    }
+
+    @Test
+    void extractGroupsMultiNestedElementBeforeLeaves() {
+        String xml = """
+                <Root>
+                  <Group>
+                    <Nested><Child>x</Child></Nested>
+                    <Name>after-nested</Name>
+                  </Group>
+                </Root>
+                """;
+
+        List<Map<String, List<String>>> groups = XmlParser.extractGroupsMulti(xml, "Group");
+
+        assertEquals(1, groups.size());
+        assertEquals(List.of("after-nested"), groups.get(0).get("Name"));
+    }
+
+    @Test
+    void extractGroupsMultiMultipleGroupsWithAndWithoutNested() {
+        String xml = """
+                <Root>
+                  <Group>
+                    <Key>a</Key>
+                  </Group>
+                  <Group>
+                    <Key>b</Key>
+                    <Container><Inner>skip</Inner></Container>
+                  </Group>
+                </Root>
+                """;
+
+        List<Map<String, List<String>>> groups = XmlParser.extractGroupsMulti(xml, "Group");
+
+        assertEquals(2, groups.size());
+        assertEquals(List.of("a"), groups.get(0).get("Key"));
+        assertEquals(List.of("b"), groups.get(1).get("Key"));
+    }
+
+    // --- extractGroups: same resilience for single-value variant ---
+
+    @Test
+    void extractGroupsSkipsNestedElements() {
+        String xml = """
+                <Root>
+                  <Group>
+                    <Name>test</Name>
+                    <Nested><Deep>skip</Deep></Nested>
+                    <Value>kept</Value>
+                  </Group>
+                </Root>
+                """;
+
+        List<Map<String, String>> groups = XmlParser.extractGroups(xml, "Group");
+
+        assertEquals(1, groups.size());
+        assertEquals("test", groups.get(0).get("Name"));
+        assertEquals("kept", groups.get(0).get("Value"));
+        assertNull(groups.get(0).get("Nested"));
+    }
+
+    // --- extractElementTree: scoped structured parsing ---
+
+    @Test
+    void extractElementTreePreservesNestedNamespaceQualifiedBlocks() {
+        var root = XmlParser.extractElementTree("""
+                <Envelope xmlns:cf="https://cloudfront.amazonaws.com/doc/2020-05-31/">
+                  <cf:Config>
+                    <cf:First><cf:Value>one</cf:Value></cf:First>
+                    <cf:Second><cf:Value><![CDATA[two]]></cf:Value></cf:Second>
+                  </cf:Config>
+                </Envelope>
+                """, "Config");
+
+        assertNotNull(root);
+        assertEquals("Config", root.name());
+        assertEquals("one", root.child("First").child("Value").text());
+        assertEquals("two", root.child("Second").child("Value").text());
+    }
+
+    @Test
+    void extractElementTreeReturnsNullForMalformedOrMissingElements() {
+        assertNull(XmlParser.extractElementTree("<Root><Target></Root>", "Target"));
+        assertNull(XmlParser.extractElementTree("<Root/>", "Target"));
+        assertNull(XmlParser.extractElementTree(null, "Target"));
+    }
+
+    // --- extractDeleteObjectEntries: batch delete Key/VersionId pairing ---
+
+    @Test
+    void extractDeleteObjectEntriesPairsKeyWithVersionId() {
+        String xml = """
+                <Delete>
+                  <Object><Key>a.txt</Key><VersionId>v1</VersionId></Object>
+                  <Object><Key>b.txt</Key><VersionId>v2</VersionId></Object>
+                </Delete>
+                """;
+
+        List<XmlParser.KeyVersion> entries = XmlParser.extractDeleteObjectEntries(xml);
+
+        assertEquals(2, entries.size());
+        assertEquals(new XmlParser.KeyVersion("a.txt", "v1"), entries.get(0));
+        assertEquals(new XmlParser.KeyVersion("b.txt", "v2"), entries.get(1));
+    }
+
+    @Test
+    void extractDeleteObjectEntriesVersionIdIsOptional() {
+        String xml = """
+                <Delete>
+                  <Object><Key>no-version.txt</Key></Object>
+                </Delete>
+                """;
+
+        List<XmlParser.KeyVersion> entries = XmlParser.extractDeleteObjectEntries(xml);
+
+        assertEquals(1, entries.size());
+        assertEquals("no-version.txt", entries.get(0).key());
+        assertNull(entries.get(0).versionId());
+    }
+
+    @Test
+    void extractDeleteObjectEntriesMixedVersionedAndUnversioned() {
+        String xml = """
+                <Delete>
+                  <Quiet>true</Quiet>
+                  <Object><Key>versioned.txt</Key><VersionId>v1</VersionId></Object>
+                  <Object><Key>plain.txt</Key></Object>
+                </Delete>
+                """;
+
+        List<XmlParser.KeyVersion> entries = XmlParser.extractDeleteObjectEntries(xml);
+
+        assertEquals(2, entries.size());
+        assertEquals("v1", entries.get(0).versionId());
+        assertNull(entries.get(1).versionId());
+    }
+
+    @Test
+    void extractDeleteObjectEntriesEmptyWhenNoObjects() {
+        assertTrue(XmlParser.extractDeleteObjectEntries("<Delete><Quiet>true</Quiet></Delete>").isEmpty());
+        assertTrue(XmlParser.extractDeleteObjectEntries(null).isEmpty());
+        assertTrue(XmlParser.extractDeleteObjectEntries("").isEmpty());
+    }
+
+    // --- extractPairsPerGroup ---
+
+    @Test
+    void extractPairsPerGroupBasic() {
+        String xml = """
+                <Root>
+                  <Group>
+                    <Leaf>text</Leaf>
+                    <Wrapper>
+                      <Pair>
+                        <Key>color</Key>
+                        <Val>red</Val>
+                      </Pair>
+                    </Wrapper>
+                  </Group>
+                </Root>
+                """;
+
+        List<Map<String, String>> pairs =
+                XmlParser.extractPairsPerGroup(xml, "Group", "Pair", "Key", "Val");
+
+        assertEquals(1, pairs.size());
+        assertEquals("red", pairs.get(0).get("color"));
+    }
+
+    @Test
+    void extractPairsPerGroupMultiplePairsPerGroup() {
+        String xml = """
+                <Root>
+                  <Group>
+                    <Wrapper>
+                      <Rule><Name>prefix</Name><Value>images/</Value></Rule>
+                      <Rule><Name>suffix</Name><Value>.jpg</Value></Rule>
+                    </Wrapper>
+                  </Group>
+                </Root>
+                """;
+
+        List<Map<String, String>> pairs =
+                XmlParser.extractPairsPerGroup(xml, "Group", "Rule", "Name", "Value");
+
+        assertEquals(1, pairs.size());
+        assertEquals("images/", pairs.get(0).get("prefix"));
+        assertEquals(".jpg", pairs.get(0).get("suffix"));
+    }
+
+    @Test
+    void extractPairsPerGroupMultipleGroups() {
+        String xml = """
+                <Root>
+                  <Group>
+                    <Tag><Key>env</Key><Val>prod</Val></Tag>
+                  </Group>
+                  <Group>
+                    <Tag><Key>team</Key><Val>infra</Val></Tag>
+                    <Tag><Key>cost</Key><Val>shared</Val></Tag>
+                  </Group>
+                </Root>
+                """;
+
+        List<Map<String, String>> pairs =
+                XmlParser.extractPairsPerGroup(xml, "Group", "Tag", "Key", "Val");
+
+        assertEquals(2, pairs.size());
+        assertEquals(Map.of("env", "prod"), pairs.get(0));
+        assertEquals(Map.of("team", "infra", "cost", "shared"), pairs.get(1));
+    }
+
+    @Test
+    void extractPairsPerGroupEmptyWhenNoPairsFound() {
+        String xml = """
+                <Root>
+                  <Group>
+                    <Name>no-pairs-here</Name>
+                  </Group>
+                </Root>
+                """;
+
+        List<Map<String, String>> pairs =
+                XmlParser.extractPairsPerGroup(xml, "Group", "Pair", "Key", "Value");
+
+        assertEquals(1, pairs.size());
+        assertTrue(pairs.get(0).isEmpty());
+    }
+
+    @Test
+    void extractPairsPerGroupNullAndEmptyXml() {
+        assertTrue(XmlParser.extractPairsPerGroup(null, "G", "P", "K", "V").isEmpty());
+        assertTrue(XmlParser.extractPairsPerGroup("", "G", "P", "K", "V").isEmpty());
+    }
+
+    @Test
+    void extractPairsPerGroupIndexAlignedWithExtractGroupsMulti() {
+        String xml = """
+                <Conf>
+                  <QueueConfiguration>
+                    <Queue>arn:q1</Queue>
+                    <Event>s3:ObjectCreated:*</Event>
+                  </QueueConfiguration>
+                  <QueueConfiguration>
+                    <Queue>arn:q2</Queue>
+                    <Event>s3:ObjectRemoved:*</Event>
+                    <Filter><S3Key>
+                      <FilterRule><Name>prefix</Name><Value>logs/</Value></FilterRule>
+                    </S3Key></Filter>
+                  </QueueConfiguration>
+                </Conf>
+                """;
+
+        var groups = XmlParser.extractGroupsMulti(xml, "QueueConfiguration");
+        var filters = XmlParser.extractPairsPerGroup(xml, "QueueConfiguration",
+                "FilterRule", "Name", "Value");
+
+        assertEquals(2, groups.size());
+        assertEquals(2, filters.size());
+        assertTrue(filters.get(0).isEmpty());
+        assertEquals("logs/", filters.get(1).get("prefix"));
+    }
+
+    // --- rootElementName: root identification and well-formedness ---
+
+    @Test
+    void rootElementNameReturnsTheRootLocalName() {
+        assertEquals("AccelerateConfiguration", XmlParser.rootElementName(
+                "<AccelerateConfiguration><Status>Enabled</Status></AccelerateConfiguration>"));
+        assertEquals("AccelerateConfiguration", XmlParser.rootElementName(
+                "<ns:AccelerateConfiguration xmlns:ns=\"urn:x\"/>"));
+        assertEquals("Wrapper", XmlParser.rootElementName(
+                "<Wrapper><AccelerateConfiguration/></Wrapper>"));
+    }
+
+    @Test
+    void rootElementNameReturnsNullForBodiesThatDoNotParse() {
+        assertNull(XmlParser.rootElementName(null));
+        assertNull(XmlParser.rootElementName(""));
+        assertNull(XmlParser.rootElementName("garbage {} not xml"));
+        assertNull(XmlParser.rootElementName("<AccelerateConfiguration><Status>Enabled"));
+        assertNull(XmlParser.rootElementName("<AccelerateConfiguration/>trailing"));
+    }
+}

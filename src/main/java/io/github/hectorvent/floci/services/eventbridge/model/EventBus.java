@@ -14,6 +14,10 @@ public class EventBus {
     private String description;
     private Map<String, String> tags = new HashMap<>();
     private Instant createdTime;
+    private String policy;
+    private String kmsKeyIdentifier;
+    private String deadLetterConfig;  // raw JSON: {"Arn":"..."}
+    private String logConfig;         // raw JSON: {"IncludeDetail":"...","Level":"..."}
 
     public EventBus() {}
 
@@ -38,4 +42,16 @@ public class EventBus {
 
     public Instant getCreatedTime() { return createdTime; }
     public void setCreatedTime(Instant createdTime) { this.createdTime = createdTime; }
+
+    public String getPolicy() { return policy; }
+    public void setPolicy(String policy) { this.policy = policy; }
+
+    public String getKmsKeyIdentifier() { return kmsKeyIdentifier; }
+    public void setKmsKeyIdentifier(String kmsKeyIdentifier) { this.kmsKeyIdentifier = kmsKeyIdentifier; }
+
+    public String getDeadLetterConfig() { return deadLetterConfig; }
+    public void setDeadLetterConfig(String deadLetterConfig) { this.deadLetterConfig = deadLetterConfig; }
+
+    public String getLogConfig() { return logConfig; }
+    public void setLogConfig(String logConfig) { this.logConfig = logConfig; }
 }

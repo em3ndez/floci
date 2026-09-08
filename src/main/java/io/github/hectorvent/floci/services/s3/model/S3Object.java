@@ -21,6 +21,12 @@ public class S3Object {
     private byte[] data;
     private Map<String, String> metadata;
     private String contentType;
+    private String contentEncoding;
+    private String contentDisposition;
+    private String cacheControl;
+    private String serverSideEncryption;
+    private String sseCustomerAlgorithm;
+    private String sseCustomerKeyMd5;
     private long size;
     private Instant lastModified;
     private String eTag;
@@ -37,6 +43,14 @@ public class S3Object {
     private String legalHoldStatus;      // "ON" | "OFF" | null
     private String acl;
 
+    // Internal-only per-write stamp (not an S3 versionId, and set even when bucket versioning is
+    // off - see S3Service#getLatestObject). A fresh value is assigned every time this key is
+    // overwritten; comparing two reads of it is how a GET detects whether a concurrent overwrite
+    // landed in the middle of reading this object's metadata and body, without holding a lock
+    // for that read's full duration.
+    @JsonIgnore
+    private String dataGeneration;
+
     public S3Object() {
         this.metadata = new HashMap<>();
         this.storageClass = "STANDARD";
@@ -51,13 +65,13 @@ public class S3Object {
         this.data = data;
         this.contentType = contentType != null ? contentType : "application/octet-stream";
         this.size = data.length;
-        this.lastModified = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        this.lastModified = Instant.now().truncatedTo(ChronoUnit.MILLIS);
         this.eTag = computeETag(data);
         this.metadata = new HashMap<>();
         this.storageClass = "STANDARD";
         this.checksum = new S3Checksum();
         this.checksum.setChecksumSHA256(S3Checksum.sha256Base64(data));
-        this.checksum.setChecksumType("FULL_OBJECT");
+        this.checksum.setChecksumType(ChecksumType.FULL_OBJECT);
         this.parts = new ArrayList<>();
         this.tags = new HashMap<>();
     }
@@ -76,6 +90,24 @@ public class S3Object {
 
     public String getContentType() { return contentType; }
     public void setContentType(String contentType) { this.contentType = contentType; }
+
+    public String getContentEncoding() { return contentEncoding; }
+    public void setContentEncoding(String contentEncoding) { this.contentEncoding = contentEncoding; }
+
+    public String getContentDisposition() { return contentDisposition; }
+    public void setContentDisposition(String contentDisposition) { this.contentDisposition = contentDisposition; }
+
+    public String getCacheControl() { return cacheControl; }
+    public void setCacheControl(String cacheControl) { this.cacheControl = cacheControl; }
+
+    public String getServerSideEncryption() { return serverSideEncryption; }
+    public void setServerSideEncryption(String serverSideEncryption) { this.serverSideEncryption = serverSideEncryption; }
+
+    public String getSseCustomerAlgorithm() { return sseCustomerAlgorithm; }
+    public void setSseCustomerAlgorithm(String sseCustomerAlgorithm) { this.sseCustomerAlgorithm = sseCustomerAlgorithm; }
+
+    public String getSseCustomerKeyMd5() { return sseCustomerKeyMd5; }
+    public void setSseCustomerKeyMd5(String sseCustomerKeyMd5) { this.sseCustomerKeyMd5 = sseCustomerKeyMd5; }
 
     public long getSize() { return size; }
     public void setSize(long size) { this.size = size; }
@@ -118,6 +150,9 @@ public class S3Object {
 
     public String getAcl() { return acl; }
     public void setAcl(String acl) { this.acl = acl; }
+
+    public String getDataGeneration() { return dataGeneration; }
+    public void setDataGeneration(String dataGeneration) { this.dataGeneration = dataGeneration; }
 
     private static String computeETag(byte[] data) {
         try {

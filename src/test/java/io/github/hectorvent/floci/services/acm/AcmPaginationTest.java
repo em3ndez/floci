@@ -1,9 +1,7 @@
 package io.github.hectorvent.floci.services.acm;
 
+import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
-import io.restassured.RestAssured;
-import io.restassured.config.EncoderConfig;
-import io.restassured.http.ContentType;
 import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
@@ -18,7 +16,6 @@ import java.util.List;
 import java.util.Set;
 
 import static io.restassured.RestAssured.given;
-import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -36,9 +33,7 @@ class AcmPaginationTest {
 
     @BeforeAll
     static void configureRestAssured() {
-        RestAssured.config = RestAssured.config().encoderConfig(
-                EncoderConfig.encoderConfig()
-                        .encodeContentTypeAs(ACM_CONTENT_TYPE, ContentType.TEXT));
+        RestAssuredJsonUtils.configureAwsContentTypes();
     }
 
     @Test
@@ -96,7 +91,9 @@ class AcmPaginationTest {
         Set<String> allArns = new HashSet<>();
         String nextToken = null;
         int pageCount = 0;
-        int maxPages = 10; // Safety limit
+        // Safety limit against a NextToken that never ends. The store is shared with every other ACM
+        // test class in the JVM, so the real page count grows with the suite.
+        int maxPages = 200;
 
         do {
             String body = nextToken == null
@@ -145,8 +142,12 @@ class AcmPaginationTest {
     @Test
     @Order(5)
     void emptyListReturnsNoNextToken() {
-        // List with a filter that matches nothing
-        given()
+        // Filter by a status none of this class's own certificates ever have. Can't assert the
+        // whole result is empty -- other test classes in the shared full-suite JVM (e.g.
+        // AcmIntegrationTest) revoke certificates of their own, and that state persists across
+        // classes. What this test actually verifies -- filtering excludes non-matching
+        // certificates and a small result page carries no NextToken -- holds regardless.
+        Response response = given()
             .header("X-Amz-Target", "CertificateManager.ListCertificates")
             .contentType(ACM_CONTENT_TYPE)
             .body("""
@@ -158,8 +159,12 @@ class AcmPaginationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("CertificateSummaryList", empty())
-            .body("NextToken", nullValue());
+            .extract().response();
+
+        List<String> revokedArns = response.jsonPath().getList("CertificateSummaryList.CertificateArn");
+        assertTrue(createdArns.stream().noneMatch(revokedArns::contains),
+                "none of this class's own (always-ISSUED) certificates should appear under a REVOKED filter");
+        assertNull(response.jsonPath().get("NextToken"));
     }
 
     @Test

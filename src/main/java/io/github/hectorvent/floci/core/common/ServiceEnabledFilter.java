@@ -1,88 +1,106 @@
 package io.github.hectorvent.floci.core.common;
 
+import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ContainerRequestFilter;
+import jakarta.ws.rs.container.ResourceInfo;
+import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.ext.Provider;
 
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
 @Provider
 public class ServiceEnabledFilter implements ContainerRequestFilter {
 
-    private static final Pattern AUTH_SERVICE_PATTERN =
-            Pattern.compile("Credential=\\S+/\\d{8}/[^/]+/([^/]+)/");
+    private static final ObjectMapper CBOR_MAPPER = new ObjectMapper(new CBORFactory());
 
-    private final ServiceRegistry serviceRegistry;
+    @Context
+    ResourceInfo resourceInfo;
+
+    private final ServiceConfigAccess serviceConfigAccess;
+    private final ResolvedServiceCatalog catalog;
 
     @Inject
-    public ServiceEnabledFilter(ServiceRegistry serviceRegistry) {
-        this.serviceRegistry = serviceRegistry;
+    public ServiceEnabledFilter(ServiceConfigAccess serviceConfigAccess, ResolvedServiceCatalog catalog) {
+        this.serviceConfigAccess = serviceConfigAccess;
+        this.catalog = catalog;
     }
 
     @Override
     public void filter(ContainerRequestContext ctx) {
-        String serviceKey = resolveServiceKey(ctx);
-        if (serviceKey == null) {
+        ResolvedRequest request = resolveService(ctx);
+        if (request == null) {
             return;
         }
-        if (!serviceRegistry.isServiceEnabled(serviceKey)) {
-            ctx.abortWith(disabledResponse(ctx, serviceKey));
+        if (!serviceConfigAccess.isEnabled(request.serviceKey())) {
+            ctx.abortWith(disabledResponse(request));
         }
     }
 
-    private String resolveServiceKey(ContainerRequestContext ctx) {
-        String target = ctx.getHeaderString("X-Amz-Target");
-        if (target != null) {
-            return serviceKeyFromTarget(target);
+    private ResolvedRequest resolveService(ContainerRequestContext ctx) {
+        ProtocolClaim claim = (ProtocolClaim) ctx.getProperty(AwsProtocolClaimFilter.CLAIM_PROPERTY);
+        if (claim != null && claim.service() != null) {
+            return new ResolvedRequest(claim.service().externalKey(), protocolFor(claim, claim.service()));
+        }
+        // A claimed RPC request whose service is unknown (unmatched X-Amz-Target
+        // or rpcv2 service name) stays unresolved so the protocol controllers
+        // keep producing their own not-found responses.
+        if (claim != null && claim.protocol() != WireProtocol.REST
+                && claim.protocol() != WireProtocol.AWS_QUERY) {
+            return null;
         }
 
-        String auth = ctx.getHeaderString("Authorization");
-        if (auth != null) {
-            Matcher m = AUTH_SERVICE_PATTERN.matcher(auth);
-            if (m.find()) {
-                return mapCredentialScope(m.group(1).toLowerCase());
+        var resourceMatch = catalog.byResourceClass(resourceClass());
+        if (resourceMatch.isPresent()) {
+            ServiceDescriptor descriptor = resourceMatch.get();
+            return new ResolvedRequest(descriptor.externalKey(), descriptor.defaultProtocol());
+        }
+
+        return SigV4CredentialScope.serviceName(ctx.getHeaderString("Authorization"))
+                .or(() -> SigV4CredentialScope.serviceNameFromCredential(
+                        ctx.getUriInfo().getQueryParameters().getFirst("X-Amz-Credential")))
+                .flatMap(catalog::byCredentialScope)
+                .map(descriptor -> new ResolvedRequest(
+                        descriptor.externalKey(), protocolFor(claim, descriptor)))
+                .orElse(null);
+    }
+
+    private ServiceProtocol protocolFor(ProtocolClaim claim, ServiceDescriptor descriptor) {
+        if (claim != null && claim.protocol().legacy() != null) {
+            return claim.protocol().legacy();
+        }
+        return descriptor.defaultProtocol();
+    }
+
+    private Class<?> resourceClass() {
+        return resourceInfo != null ? resourceInfo.getResourceClass() : null;
+    }
+
+    private Response disabledResponse(ResolvedRequest request) {
+        String message = "Service " + request.serviceKey() + " is not enabled.";
+
+        if (request.protocol() == ServiceProtocol.CBOR) {
+            try {
+                byte[] errBytes = CBOR_MAPPER.writeValueAsBytes(
+                        new AwsErrorResponse("ServiceNotAvailableException", message));
+                return Response.status(400)
+                        .header("smithy-protocol", "rpc-v2-cbor")
+                        .header("x-amzn-query-error", "ServiceNotAvailableException;Sender")
+                        .type("application/cbor")
+                        .entity(errBytes)
+                        .build();
+            } catch (Exception ignored) {
+                return Response.status(400).build();
             }
         }
 
-        return null;
-    }
-
-    private String serviceKeyFromTarget(String target) {
-        if (target.startsWith("AmazonSSM.")) return "ssm";
-        if (target.startsWith("AWSEvents.")) return "events";
-        if (target.startsWith("Logs_20140328.")) return "logs";
-        if (target.startsWith("secretsmanager.")) return "secretsmanager";
-        if (target.startsWith("Kinesis_20131202.")) return "kinesis";
-        if (target.startsWith("AmazonApiGatewayV2.")) return "apigatewayv2";
-        if (target.startsWith("TrentService.")) return "kms";
-        if (target.startsWith("AWSCognitoIdentityProviderService.")) return "cognito-idp";
-        if (target.startsWith("DynamoDB_20120810.") || target.startsWith("DynamoDBStreams_20120810.")) return "dynamodb";
-        if (target.startsWith("AmazonSQS.")) return "sqs";
-        if (target.startsWith("SNS_20100331.")) return "sns";
-        if (target.startsWith("AWSStepFunctions.")) return "states";
-        if (target.startsWith("GraniteServiceVersion20100801.")) return "monitoring";
-        return null;
-    }
-
-    private String mapCredentialScope(String scope) {
-        return switch (scope) {
-            case "execute-api" -> "apigateway";
-            default -> scope;
-        };
-    }
-
-    private Response disabledResponse(ContainerRequestContext ctx, String serviceKey) {
-        String message = "Service " + serviceKey + " is not enabled.";
-        String target = ctx.getHeaderString("X-Amz-Target");
-        String contentType = ctx.getMediaType() != null ? ctx.getMediaType().toString() : "";
-
-        if (target != null || contentType.contains("json")) {
+        if (request.protocol() == ServiceProtocol.JSON || request.protocol() == ServiceProtocol.REST_JSON) {
             return Response.status(400)
                     .type(MediaType.APPLICATION_JSON)
+                    .header("X-Amzn-Errortype", "ServiceNotAvailableException")
+                    .header("x-amzn-query-error", "ServiceNotAvailableException;Sender")
                     .entity(new AwsErrorResponse("ServiceNotAvailableException", message))
                     .build();
         }
@@ -98,5 +116,8 @@ public class ServiceEnabledFilter implements ContainerRequestFilter {
                 .end("ErrorResponse")
                 .build();
         return Response.status(400).entity(xml).type(MediaType.APPLICATION_XML).build();
+    }
+
+    private record ResolvedRequest(String serviceKey, ServiceProtocol protocol) {
     }
 }

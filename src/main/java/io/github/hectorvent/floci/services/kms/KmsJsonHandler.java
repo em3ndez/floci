@@ -1,38 +1,53 @@
 package io.github.hectorvent.floci.services.kms;
 
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.services.kms.model.KmsAlias;
+import io.github.hectorvent.floci.services.kms.model.KmsGrant;
 import io.github.hectorvent.floci.services.kms.model.KmsKey;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.services.kms.model.KmsKeySpec;
+import io.github.hectorvent.floci.services.kms.model.KmsKeyUsage;
+import io.github.hectorvent.floci.services.kms.model.KmsMessageType;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
-import java.util.Base64;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
+
+import static io.github.hectorvent.floci.core.common.ReservedTags.rejectUnknownReservedTags;
 
 @ApplicationScoped
 public class KmsJsonHandler {
 
     private final KmsService service;
     private final ObjectMapper objectMapper;
+    private final RegionResolver regionResolver;
 
     @Inject
-    public KmsJsonHandler(KmsService service, ObjectMapper objectMapper) {
+    public KmsJsonHandler(KmsService service, ObjectMapper objectMapper, RegionResolver regionResolver) {
         this.service = service;
         this.objectMapper = objectMapper;
+        this.regionResolver = regionResolver;
     }
 
     public Response handle(String action, JsonNode request, String region) {
         return switch (action) {
             case "CreateKey" -> handleCreateKey(request, region);
+            case "GenerateRandom" -> handleGenerateRandom(request, region);
+            case "GetPublicKey" -> handleGetPublicKey(request, region);
             case "DescribeKey" -> handleDescribeKey(request, region);
             case "ListKeys" -> handleListKeys(request, region);
+            case "CreateGrant" -> handleCreateGrant(request, region);
+            case "ListGrants" -> handleListGrants(request, region);
+            case "ListRetirableGrants" -> handleListRetirableGrants(request, region);
+            case "RevokeGrant" -> handleRevokeGrant(request, region);
+            case "RetireGrant" -> handleRetireGrant(request, region);
             case "Encrypt" -> handleEncrypt(request, region);
             case "Decrypt" -> handleDecrypt(request, region);
             case "ReEncrypt" -> handleReEncrypt(request, region);
@@ -40,7 +55,10 @@ public class KmsJsonHandler {
             case "GenerateDataKeyWithoutPlaintext" -> handleGenerateDataKeyWithoutPlaintext(request, region);
             case "Sign" -> handleSign(request, region);
             case "Verify" -> handleVerify(request, region);
+            case "GenerateMac" -> handleGenerateMac(request, region);
+            case "VerifyMac" -> handleVerifyMac(request, region);
             case "CreateAlias" -> handleCreateAlias(request, region);
+            case "UpdateAlias" -> handleUpdateAlias(request, region);
             case "DeleteAlias" -> handleDeleteAlias(request, region);
             case "ListAliases" -> handleListAliases(request, region);
             case "ScheduleKeyDeletion" -> handleScheduleKeyDeletion(request, region);
@@ -48,6 +66,19 @@ public class KmsJsonHandler {
             case "TagResource" -> handleTagResource(request, region);
             case "UntagResource" -> handleUntagResource(request, region);
             case "ListResourceTags" -> handleListResourceTags(request, region);
+            case "GetKeyPolicy" -> handleGetKeyPolicy(request, region);
+            case "PutKeyPolicy" -> handlePutKeyPolicy(request, region);
+            case "ListKeyPolicies" -> handleListKeyPolicies(request, region);
+            case "UpdateKeyDescription" -> handleUpdateKeyDescription(request, region);
+            case "GetKeyRotationStatus" -> handleGetKeyRotationStatus(request, region);
+            case "EnableKeyRotation" -> handleEnableKeyRotation(request, region);
+            case "DisableKeyRotation" -> handleDisableKeyRotation(request, region);
+            case "EnableKey" -> handleEnableKey(request, region);
+            case "DisableKey" -> handleDisableKey(request, region);
+            case "RotateKeyOnDemand" -> handleRotateKeyOnDemand(request, region);
+            case "GetParametersForImport" -> handleGetParametersForImport(request, region);
+            case "ImportKeyMaterial" -> handleImportKeyMaterial(request, region);
+            case "DeleteImportedKeyMaterial" -> handleDeleteImportedKeyMaterial(request, region);
             default -> Response.status(400)
                     .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported."))
                     .build();
@@ -56,9 +87,34 @@ public class KmsJsonHandler {
 
     private Response handleCreateKey(JsonNode request, String region) {
         String description = request.path("Description").asText(null);
-        KmsKey key = service.createKey(description, region);
+        String keyUsage = request.path("KeyUsage").asText("ENCRYPT_DECRYPT");
+        String keySpec = !request.path("KeySpec").isMissingNode()
+                ? request.path("KeySpec").asText("SYMMETRIC_DEFAULT")
+                : request.path("CustomerMasterKeySpec").asText("SYMMETRIC_DEFAULT");
+        String policy = request.path("Policy").isMissingNode() ? null : request.path("Policy").asText(null);
+        Map<String, String> tags = new HashMap<>();
+        request.path("Tags").forEach(t -> tags.put(t.path("TagKey").asText(), t.path("TagValue").asText()));
+        rejectUnknownReservedTags(tags,"TagException");
+        String origin = request.path("Origin").asText(null);
+        KmsKey key = service.createKey(description, keyUsage, keySpec, policy, tags, origin, region);
         ObjectNode response = objectMapper.createObjectNode();
-        response.set("KeyMetadata", keyToNode(key));
+        response.set("KeyMetadata", addKeyMetadata(key));
+        return Response.ok(response).build();
+    }
+
+    private Response handleGetPublicKey(JsonNode request, String region) {
+        String keyId = request.path("KeyId").asText();
+        KmsKey key = service.getPublicKey(keyId, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("KeyId", key.getArn());
+        response.put("PublicKey", key.getPublicKeyEncoded());
+        response.put("CustomerMasterKeySpec", key.getKeySpec().name());
+        response.put("KeySpec", key.getKeySpec().name());
+        response.put("KeyUsage", key.getKeyUsage().name());
+
+        addAlgorithms(key, response);
+
         return Response.ok(response).build();
     }
 
@@ -66,7 +122,7 @@ public class KmsJsonHandler {
         String keyId = request.path("KeyId").asText();
         KmsKey key = service.describeKey(keyId, region);
         ObjectNode response = objectMapper.createObjectNode();
-        response.set("KeyMetadata", keyToNode(key));
+        response.set("KeyMetadata", addKeyMetadata(key));
         return Response.ok(response).build();
     }
 
@@ -83,30 +139,170 @@ public class KmsJsonHandler {
         return Response.ok(response).build();
     }
 
-    private Response handleEncrypt(JsonNode request, String region) {
+    private Response handleListGrants(JsonNode request, String region) {
         String keyId = request.path("KeyId").asText();
-        byte[] plaintext = Base64.getDecoder().decode(request.path("Plaintext").asText());
-        byte[] ciphertext = service.encrypt(keyId, plaintext, region);
+        String marker = request.path("Marker").isMissingNode() ? null : request.path("Marker").asText(null);
+        Integer limit = request.path("Limit").isMissingNode() ? null : request.path("Limit").asInt();
+        String grantId = request.path("GrantId").isMissingNode() ? null : request.path("GrantId").asText(null);
+        String granteePrincipal = request.path("GranteePrincipal").isMissingNode() ? null : request.path("GranteePrincipal").asText(null);
+
+        Map<String, Object> result = service.listGrants(keyId, region, marker, limit, grantId, granteePrincipal);
 
         ObjectNode response = objectMapper.createObjectNode();
-        response.put("CiphertextBlob", Base64.getEncoder().encodeToString(ciphertext));
-        response.put("KeyId", service.describeKey(keyId, region).getArn());
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> grants = (List<Map<String, Object>>) result.get("Grants");
+        ArrayNode array = response.putArray("Grants");
+        for (Map<String, Object> grant : grants) {
+            ObjectNode entry = array.addObject();
+            entry.put("GrantId", (String) grant.get("GrantId"));
+            entry.put("KeyId", (String) grant.get("KeyId"));
+            entry.put("GranteePrincipal", (String) grant.get("GranteePrincipal"));
+            entry.put("CreationDate", ((Number) grant.get("CreationDate")).longValue());
+            if (grant.get("Name") != null) {
+                entry.put("Name", (String) grant.get("Name"));
+            }
+            if (grant.get("Constraints") != null) {
+                entry.set("Constraints", objectMapper.valueToTree(grant.get("Constraints")));
+            }
+            ArrayNode operations = entry.putArray("Operations");
+            @SuppressWarnings("unchecked")
+            List<String> operationValues = (List<String>) grant.get("Operations");
+            operationValues.forEach(operations::add);
+            if (grant.get("RetiringPrincipal") != null) {
+                entry.put("RetiringPrincipal", (String) grant.get("RetiringPrincipal"));
+            }
+        }
+        response.put("Truncated", (boolean) result.get("Truncated"));
+        if (Boolean.TRUE.equals(result.get("Truncated"))) {
+            response.put("NextMarker", (String) result.get("NextMarker"));
+        }
+        return Response.ok(response).build();
+    }
+
+    private Response handleListRetirableGrants(JsonNode request, String region) {
+        String retiringPrincipal = request.path("RetiringPrincipal").asText(null);
+        String marker = request.path("Marker").isMissingNode() ? null : request.path("Marker").asText(null);
+        Integer limit = request.path("Limit").isMissingNode() ? null : request.path("Limit").asInt();
+
+        Map<String, Object> result = service.listRetirableGrants(retiringPrincipal, region, marker, limit);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> grants = (List<Map<String, Object>>) result.get("Grants");
+        ArrayNode array = response.putArray("Grants");
+        for (Map<String, Object> grant : grants) {
+            ObjectNode entry = array.addObject();
+            entry.put("GrantId", (String) grant.get("GrantId"));
+            entry.put("KeyId", (String) grant.get("KeyId"));
+            entry.put("GranteePrincipal", (String) grant.get("GranteePrincipal"));
+            entry.put("CreationDate", ((Number) grant.get("CreationDate")).longValue());
+            if (grant.get("Name") != null) {
+                entry.put("Name", (String) grant.get("Name"));
+            }
+            if (grant.get("Constraints") != null) {
+                entry.set("Constraints", objectMapper.valueToTree(grant.get("Constraints")));
+            }
+            ArrayNode operations = entry.putArray("Operations");
+            @SuppressWarnings("unchecked")
+            List<String> operationValues = (List<String>) grant.get("Operations");
+            operationValues.forEach(operations::add);
+            if (grant.get("RetiringPrincipal") != null) {
+                entry.put("RetiringPrincipal", (String) grant.get("RetiringPrincipal"));
+            }
+        }
+        response.put("Truncated", (boolean) result.get("Truncated"));
+        if (Boolean.TRUE.equals(result.get("Truncated"))) {
+            response.put("NextMarker", (String) result.get("NextMarker"));
+        }
+        return Response.ok(response).build();
+    }
+
+    private Response handleCreateGrant(JsonNode request, String region) {
+        String keyId = request.path("KeyId").asText(null);
+        String granteePrincipal = request.path("GranteePrincipal").asText(null);
+        List<String> operations = new java.util.ArrayList<>();
+        request.path("Operations").forEach(operation -> operations.add(operation.asText()));
+        String retiringPrincipal = request.path("RetiringPrincipal").isMissingNode()
+                ? null : request.path("RetiringPrincipal").asText(null);
+        String name = request.path("Name").isMissingNode() ? null : request.path("Name").asText(null);
+        JsonNode constraintsNode = request.path("Constraints");
+        if (!constraintsNode.isMissingNode() && !constraintsNode.isNull() && !constraintsNode.isObject()) {
+            throw new AwsException("ValidationException",
+                    "1 validation error detected: Value at 'constraints' failed to satisfy constraint: "
+                            + "Member must be a structure", 400);
+        }
+        Map<String, Object> constraints = constraintsNode.isObject()
+                ? objectMapper.convertValue(constraintsNode, Map.class)
+                : null;
+
+        KmsGrant grant = service.createGrant(
+                keyId, granteePrincipal, operations, retiringPrincipal, name, constraints, region);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("GrantId", grant.getGrantId());
+        response.put("GrantToken", grant.getGrantToken());
+        return Response.ok(response).build();
+    }
+
+    private Response handleRevokeGrant(JsonNode request, String region) {
+        String keyId = request.path("KeyId").asText(null);
+        String grantId = request.path("GrantId").asText(null);
+
+        service.revokeGrant(keyId, grantId, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleRetireGrant(JsonNode request, String region) {
+        String grantToken = request.path("GrantToken").isMissingNode()
+                ? null : request.path("GrantToken").asText(null);
+        String keyId = request.path("KeyId").isMissingNode()
+                ? null : request.path("KeyId").asText(null);
+        String grantId = request.path("GrantId").isMissingNode()
+                ? null : request.path("GrantId").asText(null);
+
+        service.retireGrant(grantToken, keyId, grantId, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    // Blob fields arrive base64-encoded on the wire. A value that is not valid base64 is a
+    // client deserialization error, not a server fault — without this the IllegalArgumentException
+    // escapes to the dispatcher's generic catch and surfaces as 500 InternalFailure.
+    private static byte[] decodeBlob(JsonNode request, String field) {
+        try {
+            return Base64.getDecoder().decode(request.path(field).asText());
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("SerializationException", field + " is not valid base64.", 400);
+        }
+    }
+
+    private Response handleEncrypt(JsonNode request, String region) {
+        String keyId = request.path("KeyId").asText();
+        byte[] plaintext = decodeBlob(request, "Plaintext");
+        Map<String, String> context = readEncryptionContext(request.path("EncryptionContext"));
+        String algorithm = request.path("EncryptionAlgorithm").asText(null);
+
+        KmsService.EncryptResult result = service.encrypt(keyId, plaintext, context, algorithm, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("CiphertextBlob", Base64.getEncoder().encodeToString(result.ciphertext()));
+        response.put("KeyId", result.keyArn());
+        response.put("EncryptionAlgorithm", result.encryptionAlgorithm());
         return Response.ok(response).build();
     }
 
     private Response handleDecrypt(JsonNode request, String region) {
-        byte[] ciphertext = Base64.getDecoder().decode(request.path("CiphertextBlob").asText());
-        byte[] plaintext = service.decrypt(ciphertext, region);
+        byte[] ciphertext = decodeBlob(request, "CiphertextBlob");
+        Map<String, String> context = readEncryptionContext(request.path("EncryptionContext"));
+        String requestKeyId = request.path("KeyId").asText(null);
+        String algorithm = request.path("EncryptionAlgorithm").asText(null);
+
+        KmsService.DecryptResult result = service.decryptAndResolveKey(ciphertext, context, region, requestKeyId, algorithm);
 
         ObjectNode response = objectMapper.createObjectNode();
-        response.put("Plaintext", Base64.getEncoder().encodeToString(plaintext));
-        // In our mock, we don't strictly track which key was used for decryption from blob alone,
-        // but we could extract it from our mock format "kms:keyId:..."
-        String data = new String(ciphertext);
-        if (data.startsWith("kms:")) {
-            String keyId = data.split(":")[1];
-            response.put("KeyId", service.describeKey(keyId, region).getArn());
+        response.put("Plaintext", Base64.getEncoder().encodeToString(result.plaintext()));
+        if (result.keyArn() != null) {
+            response.put("KeyId", result.keyArn());
         }
+        response.put("EncryptionAlgorithm", result.encryptionAlgorithm());
         return Response.ok(response).build();
     }
 
@@ -114,8 +310,9 @@ public class KmsJsonHandler {
         String keyId = request.path("KeyId").asText();
         String spec = request.path("KeySpec").asText(null);
         int numberOfBytes = request.path("NumberOfBytes").asInt(0);
+        Map<String, String> context = readEncryptionContext(request.path("EncryptionContext"));
 
-        Map<String, Object> result = service.generateDataKey(keyId, spec, numberOfBytes, region);
+        Map<String, Object> result = service.generateDataKey(keyId, spec, numberOfBytes, context, region);
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("Plaintext", Base64.getEncoder().encodeToString((byte[]) result.get("Plaintext")));
@@ -128,8 +325,9 @@ public class KmsJsonHandler {
         String keyId = request.path("KeyId").asText();
         String spec = request.path("KeySpec").asText(null);
         int numberOfBytes = request.path("NumberOfBytes").asInt(0);
+        Map<String, String> context = readEncryptionContext(request.path("EncryptionContext"));
 
-        Map<String, Object> result = service.generateDataKey(keyId, spec, numberOfBytes, region);
+        Map<String, Object> result = service.generateDataKey(keyId, spec, numberOfBytes, context, region);
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("CiphertextBlob", Base64.getEncoder().encodeToString((byte[]) result.get("CiphertextBlob")));
@@ -138,25 +336,44 @@ public class KmsJsonHandler {
     }
 
     private Response handleReEncrypt(JsonNode request, String region) {
-        byte[] ciphertext = Base64.getDecoder().decode(request.path("CiphertextBlob").asText());
+        byte[] ciphertext = decodeBlob(request, "CiphertextBlob");
         String destKeyId = request.path("DestinationKeyId").asText();
+        Map<String, String> sourceContext = readEncryptionContext(request.path("SourceEncryptionContext"));
+        Map<String, String> destContext = readEncryptionContext(request.path("DestinationEncryptionContext"));
+        String sourceAlgorithm = request.path("SourceEncryptionAlgorithm").asText(null);
+        String destAlgorithm = request.path("DestinationEncryptionAlgorithm").asText(null);
 
-        byte[] plaintext = service.decrypt(ciphertext, region);
-        byte[] newCiphertext = service.encrypt(destKeyId, plaintext, region);
+        String sourceKeyId = request.path("SourceKeyId").asText(null);
+        KmsService.DecryptResult source = service.decryptAndResolveKey(
+                ciphertext, sourceContext, region, sourceKeyId, sourceAlgorithm);
+        KmsService.EncryptResult destination = service.encrypt(
+                destKeyId, source.plaintext(), destContext, destAlgorithm, region);
 
         ObjectNode response = objectMapper.createObjectNode();
-        response.put("CiphertextBlob", Base64.getEncoder().encodeToString(newCiphertext));
-        response.put("KeyId", service.describeKey(destKeyId, region).getArn());
-        response.put("SourceKeyId", service.decryptToKeyArn(ciphertext, region));
+        response.put("CiphertextBlob", Base64.getEncoder().encodeToString(destination.ciphertext()));
+        response.put("KeyId", destination.keyArn());
+        response.put("SourceKeyId", source.keyArn());
+        response.put("SourceEncryptionAlgorithm", source.encryptionAlgorithm());
+        response.put("DestinationEncryptionAlgorithm", destination.encryptionAlgorithm());
         return Response.ok(response).build();
+    }
+
+    private static Map<String, String> readEncryptionContext(JsonNode node) {
+        if (node == null || node.isMissingNode() || node.isNull() || !node.isObject()) {
+            return Map.of();
+        }
+        Map<String, String> result = new HashMap<>();
+        node.fields().forEachRemaining(e -> result.put(e.getKey(), e.getValue().asText()));
+        return result;
     }
 
     private Response handleSign(JsonNode request, String region) {
         String keyId = request.path("KeyId").asText();
-        byte[] message = Base64.getDecoder().decode(request.path("Message").asText());
+        byte[] message = decodeBlob(request, "Message");
         String algorithm = request.path("SigningAlgorithm").asText("RSASSA_PSS_SHA_256");
+        KmsMessageType messageType = KmsMessageType.fromString(request.path("MessageType").asText("RAW"));
 
-        byte[] signature = service.sign(keyId, message, algorithm, region);
+        byte[] signature = service.sign(keyId, message, algorithm, messageType, region);
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("KeyId", service.describeKey(keyId, region).getArn());
@@ -167,11 +384,12 @@ public class KmsJsonHandler {
 
     private Response handleVerify(JsonNode request, String region) {
         String keyId = request.path("KeyId").asText();
-        byte[] message = Base64.getDecoder().decode(request.path("Message").asText());
-        byte[] signature = Base64.getDecoder().decode(request.path("Signature").asText());
+        byte[] message = decodeBlob(request, "Message");
+        byte[] signature = decodeBlob(request, "Signature");
         String algorithm = request.path("SigningAlgorithm").asText("RSASSA_PSS_SHA_256");
+        KmsMessageType messageType = KmsMessageType.fromString(request.path("MessageType").asText("RAW"));
 
-        boolean valid = service.verify(keyId, message, signature, algorithm, region);
+        boolean valid = service.verify(keyId, message, signature, algorithm, messageType, region);
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("KeyId", service.describeKey(keyId, region).getArn());
@@ -180,8 +398,42 @@ public class KmsJsonHandler {
         return Response.ok(response).build();
     }
 
+    private Response handleGenerateMac(JsonNode request, String region) {
+        String keyId = request.path("KeyId").asText();
+        byte[] message = decodeBlob(request, "Message");
+        String algorithm = request.path("MacAlgorithm").asText();
+
+        KmsService.GenerateMacResult result = service.generateMacAndResolveKey(keyId, message, algorithm, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("KeyId", result.keyArn());
+        response.put("Mac", Base64.getEncoder().encodeToString(result.mac()));
+        response.put("MacAlgorithm", algorithm);
+        return Response.ok(response).build();
+    }
+
+    private Response handleVerifyMac(JsonNode request, String region) {
+        String keyId = request.path("KeyId").asText();
+        byte[] message = decodeBlob(request, "Message");
+        byte[] mac = decodeBlob(request, "Mac");
+        String algorithm = request.path("MacAlgorithm").asText();
+
+        KmsService.VerifyMacResult result = service.verifyMacAndResolveKey(keyId, message, mac, algorithm, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("KeyId", result.keyArn());
+        response.put("MacAlgorithm", algorithm);
+        response.put("MacValid", true);
+        return Response.ok(response).build();
+    }
+
     private Response handleCreateAlias(JsonNode request, String region) {
         service.createAlias(request.path("AliasName").asText(), request.path("TargetKeyId").asText(), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleUpdateAlias(JsonNode request, String region) {
+        service.updateAlias(request.path("AliasName").asText(), request.path("TargetKeyId").asText(), region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
@@ -191,7 +443,9 @@ public class KmsJsonHandler {
     }
 
     private Response handleListAliases(JsonNode request, String region) {
-        List<KmsAlias> aliases = service.listAliases(region);
+        JsonNode keyIdNode = request.path("KeyId");
+        String keyId = (keyIdNode.isMissingNode() || keyIdNode.isNull()) ? null : keyIdNode.asText();
+        List<KmsAlias> aliases = service.listAliases(keyId, region);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("Aliases");
         for (KmsAlias a : aliases) {
@@ -228,6 +482,7 @@ public class KmsJsonHandler {
         String keyId = request.path("KeyId").asText();
         Map<String, String> tags = new HashMap<>();
         request.path("Tags").forEach(t -> tags.put(t.path("TagKey").asText(), t.path("TagValue").asText()));
+        ReservedTags.rejectReservedTagsOnUpdate(tags);
         service.tagResource(keyId, tags, region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
@@ -254,23 +509,183 @@ public class KmsJsonHandler {
         return Response.ok(response).build();
     }
 
-    private ObjectNode keyToNode(KmsKey k) {
-        ObjectNode node = objectMapper.createObjectNode();
-        node.put("AWSAccountId", "000000000000");
-        node.put("KeyId", k.getKeyId());
-        node.put("Arn", k.getArn());
-        node.put("CreationDate", k.getCreationDate());
-        node.put("Enabled", k.isEnabled());
-        node.put("Description", k.getDescription());
-        node.put("KeyUsage", k.getKeyUsage());
-        node.put("KeyState", k.getKeyState());
-        node.put("Origin", "AWS_KMS");
-        node.put("KeyManager", "CUSTOMER");
-        node.put("CustomerMasterKeySpec", k.getCustomerMasterKeySpec());
-        if (k.getDeletionDate() > 0) {
-            node.put("DeletionDate", k.getDeletionDate());
+    private Response handleGetKeyPolicy(JsonNode request, String region) {
+        Map<String, Object> result = service.getKeyPolicy(request.path("KeyId").asText(), region);
+        return Response.ok(objectMapper.valueToTree(result)).build();
+    }
+
+    private Response handlePutKeyPolicy(JsonNode request, String region) {
+        service.putKeyPolicy(
+                request.path("KeyId").asText(),
+                request.path("Policy").asText(),
+                region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleListKeyPolicies(JsonNode request, String region) {
+        // Limit and Marker are accepted by simply not being read; see the service javadoc.
+        Map<String, Object> result = service.listKeyPolicies(
+                requiredText(request, "KeyId"),
+                region);
+        return Response.ok(objectMapper.valueToTree(result)).build();
+    }
+
+    private Response handleUpdateKeyDescription(JsonNode request, String region) {
+        service.updateKeyDescription(
+                request.path("KeyId").asText(),
+                requiredText(request, "Description"),
+                region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private String requiredText(JsonNode request, String field) {
+        JsonNode value = request.path(field);
+        if (value.isMissingNode() || value.isNull()) {
+            throw new AwsException("ValidationException", field + " is required", 400);
         }
-        return node;
+        return value.asText();
+    }
+
+    private Response handleGetKeyRotationStatus(JsonNode request, String region) {
+        String keyId = request.path("KeyId").asText();
+        boolean enabled = service.getKeyRotationStatus(keyId, region);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("KeyRotationEnabled", enabled);
+        return Response.ok(response).build();
+    }
+
+    private Response handleEnableKeyRotation(JsonNode request, String region) {
+        service.enableKeyRotation(request.path("KeyId").asText(), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleDisableKeyRotation(JsonNode request, String region) {
+        service.disableKeyRotation(request.path("KeyId").asText(), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleEnableKey(JsonNode request, String region) {
+        service.enableKey(request.path("KeyId").asText(), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleDisableKey(JsonNode request, String region) {
+        service.disableKey(request.path("KeyId").asText(), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleRotateKeyOnDemand(JsonNode request, String region) {
+        String keyId = service.rotateKeyOnDemand(request.path("KeyId").asText(), region);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("KeyId", keyId);
+        return Response.ok(response).build();
+    }
+
+    private Response handleGenerateRandom(JsonNode request, String region) {
+        if (!request.path("Recipient").isMissingNode()) {
+            throw new AwsException("ValidationException",
+                    "Recipient is not supported for GenerateRandom without Nitro Enclave support.",
+                    400);
+        }
+        if (!request.path("CustomKeyStoreId").isMissingNode()) {
+            throw new AwsException("ValidationException",
+                    "Custom key stores are not supported.",
+                    400);
+        }
+        int numberOfBytes = request.path("NumberOfBytes").asInt(0);
+        byte[] randomBytes = service.generateRandom(numberOfBytes);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("Plaintext", Base64.getEncoder().encodeToString(randomBytes));
+        return Response.ok(response).build();
+    }
+
+    private Response handleGetParametersForImport(JsonNode request, String region) {
+        String keyId = requireKeyId(request);
+        KmsService.ImportParameters parameters = service.getParametersForImport(
+                keyId,
+                request.path("WrappingAlgorithm").asText(null),
+                request.path("WrappingKeySpec").asText(null),
+                region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("KeyId", parameters.keyArn());
+        response.put("PublicKey", parameters.publicKeyEncoded());
+        response.put("ImportToken", parameters.importToken());
+        response.put("ParametersValidTo", parameters.parametersValidTo());
+        return Response.ok(response).build();
+    }
+
+    private Response handleImportKeyMaterial(JsonNode request, String region) {
+        String keyId = requireKeyId(request);
+        String importToken = request.path("ImportToken").asText(null);
+        byte[] encryptedKeyMaterial = requireBlob(request, "EncryptedKeyMaterial");
+        Long validTo = request.hasNonNull("ValidTo") ? request.path("ValidTo").asLong() : null;
+
+        KmsKey key = service.importKeyMaterial(keyId, importToken, encryptedKeyMaterial,
+                request.path("ExpirationModel").asText(null), validTo,
+                request.path("ImportType").asText(null), region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("KeyId", key.getArn());
+        response.put("KeyMaterialId", key.getKeyMaterialId());
+        return Response.ok(response).build();
+    }
+
+    private Response handleDeleteImportedKeyMaterial(JsonNode request, String region) {
+        KmsKey key = service.deleteImportedKeyMaterial(requireKeyId(request), region);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("KeyId", key.getArn());
+        if (key.getKeyMaterialId() != null) {
+            response.put("KeyMaterialId", key.getKeyMaterialId());
+        }
+        return Response.ok(response).build();
+    }
+
+    private static String requireKeyId(JsonNode request) {
+        String keyId = request.path("KeyId").asText(null);
+        if (keyId == null || keyId.isBlank()) {
+            throw new AwsException("ValidationException", "KeyId is required.", 400);
+        }
+        return keyId;
+    }
+
+    /**
+     * A required blob member. {@link #decodeBlob} reads a missing member as an empty blob, which
+     * would reach the operation as key material of the wrong length instead of the absent member
+     * it actually is.
+     */
+    private static byte[] requireBlob(JsonNode request, String member) {
+        if (!request.path(member).isTextual()) {
+            throw new AwsException("ValidationException", member + " is required.", 400);
+        }
+        return decodeBlob(request, member);
+    }
+
+    private ObjectNode addKeyMetadata(KmsKey k) {
+        ObjectNode keyMetadata = objectMapper.createObjectNode();
+        keyMetadata.put("AWSAccountId", regionResolver.getAccountId());
+        keyMetadata.put("KeyId", k.getKeyId());
+        keyMetadata.put("Arn", k.getArn());
+        keyMetadata.put("CreationDate", k.getCreationDate());
+        keyMetadata.put("Enabled", k.isEnabled());
+        keyMetadata.put("Description", k.getDescription());
+        keyMetadata.put("KeyUsage", k.getKeyUsage().name());
+        keyMetadata.put("KeyState", k.getKeyState());
+        keyMetadata.put("Origin", k.getOrigin());
+        if (k.getExpirationModel() != null) {
+            keyMetadata.put("ExpirationModel", k.getExpirationModel());
+        }
+        if (k.getValidTo() > 0) {
+            keyMetadata.put("ValidTo", k.getValidTo());
+        }
+        keyMetadata.put("KeyManager", "CUSTOMER");
+        keyMetadata.put("CustomerMasterKeySpec", k.getKeySpec().name());
+        keyMetadata.put("KeySpec", k.getKeySpec().name());
+        addAlgorithms(k, keyMetadata);
+        if (k.getDeletionDate() > 0) {
+            keyMetadata.put("DeletionDate", k.getDeletionDate());
+        }
+        return keyMetadata;
     }
 
     private ObjectNode errorResponse(String code, String message) {
@@ -278,5 +693,31 @@ public class KmsJsonHandler {
         error.put("__type", code);
         error.put("message", message);
         return error;
+    }
+
+    private void addAlgorithms(KmsKey key, ObjectNode response) {
+        if (KmsKeyUsage.SIGN_VERIFY == key.getKeyUsage()) {
+            ArrayNode signingAlgorithms = response.putArray("SigningAlgorithms");
+            key.getKeySpec().getAlgorithm()
+                    .stream()
+                    .filter(algorithm -> algorithm.getKeyUsage() == KmsKeyUsage.SIGN_VERIFY)
+                    .map(KmsKeySpec.Algorithm::getAlgName)
+                    .filter(Objects::nonNull)
+                    .forEach(signingAlgorithms::add);
+        } else if (KmsKeyUsage.ENCRYPT_DECRYPT == key.getKeyUsage()) {
+            if (key.getKeySpec().getKeyType() == KmsKeySpec.KeyType.RSA
+                || key.getKeySpec().getKeyType() == KmsKeySpec.KeyType.SYMMETRIC) {
+                ArrayNode encryptionAlgorithms = response.putArray("EncryptionAlgorithms");
+                key.getKeySpec().getAlgorithm()
+                        .stream()
+                        .filter(algorithm -> algorithm.getKeyUsage() == KmsKeyUsage.ENCRYPT_DECRYPT)
+                        .map(KmsKeySpec.Algorithm::getAlgName)
+                        .filter(Objects::nonNull)
+                        .forEach(encryptionAlgorithms::add);
+            }
+        } else if (KmsKeyUsage.GENERATE_VERIFY_MAC == key.getKeyUsage()
+                && key.getKeySpec().getKeyType() == KmsKeySpec.KeyType.HMAC) {
+                    response.putArray("MacAlgorithms").add(key.getKeySpec().getAlgorithm().getFirst().getAlgName());
+            }
     }
 }

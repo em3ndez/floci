@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.dynamodb.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -32,9 +34,28 @@ public class TableDefinition {
     private String billingMode; // "PROVISIONED" or "PAY_PER_REQUEST"
     private String ttlAttributeName;
     private boolean ttlEnabled;
+    private boolean pointInTimeRecoveryEnabled;
+    private int pointInTimeRecoveryRecoveryPeriodInDays;
+    private boolean deletionProtectionEnabled;
     private boolean streamEnabled;
     private String streamArn;
     private String streamViewType;
+    private boolean sseEnabled;
+    private String sseType;
+    private String kmsMasterKeyArn;
+    private List<KinesisStreamingDestination> kinesisStreamingDestinations;
+    private String tableId;
+    private String tableClass; // "STANDARD" or "STANDARD_INFREQUENT_ACCESS"
+    private Integer onDemandMaxReadRequestUnits;
+    private Integer onDemandMaxWriteRequestUnits;
+    // Replica regions for a global table (single-process emulator backs them all with this table's
+    // data; the list drives the DescribeTable Replicas/GlobalTableVersion projection).
+    private List<String> replicaRegions;
+    // Resource-based policy attached via PutResourcePolicy (JSON policy document text), and the
+    // opaque revision id AWS hands back so callers can pass ExpectedRevisionId for optimistic
+    // concurrency on subsequent Put/DeleteResourcePolicy calls. Null when no policy is attached.
+    private String resourcePolicy;
+    private String resourcePolicyRevisionId;
 
     public TableDefinition() {
         this.keySchema = new ArrayList<>();
@@ -42,6 +63,9 @@ public class TableDefinition {
         this.tags = new HashMap<>();
         this.globalSecondaryIndexes = new ArrayList<>();
         this.localSecondaryIndexes = new ArrayList<>();
+        this.pointInTimeRecoveryRecoveryPeriodInDays = 35;
+        this.kinesisStreamingDestinations = new ArrayList<>();
+        this.replicaRegions = new ArrayList<>();
     }
 
     public TableDefinition(String tableName,
@@ -61,11 +85,15 @@ public class TableDefinition {
         this.creationDateTime = Instant.now();
         this.itemCount = 0;
         this.tableSizeBytes = 0;
-        this.tableArn = "arn:aws:dynamodb:" + region + ":" + accountId + ":table/" + tableName;
+        this.tableArn = AwsArnUtils.Arn.of("dynamodb", region, accountId, "table/" + tableName).toString();
+        this.tableId = java.util.UUID.randomUUID().toString();
         this.provisionedThroughput = new ProvisionedThroughput(5, 5);
         this.tags = new HashMap<>();
         this.globalSecondaryIndexes = new ArrayList<>();
         this.localSecondaryIndexes = new ArrayList<>();
+        this.pointInTimeRecoveryRecoveryPeriodInDays = 35;
+        this.kinesisStreamingDestinations = new ArrayList<>();
+        this.replicaRegions = new ArrayList<>();
     }
 
     public String getTableName() { return tableName; }
@@ -117,6 +145,19 @@ public class TableDefinition {
     public boolean isTtlEnabled() { return ttlEnabled; }
     public void setTtlEnabled(boolean ttlEnabled) { this.ttlEnabled = ttlEnabled; }
 
+    public boolean isPointInTimeRecoveryEnabled() { return pointInTimeRecoveryEnabled; }
+    public void setPointInTimeRecoveryEnabled(boolean pointInTimeRecoveryEnabled) {
+        this.pointInTimeRecoveryEnabled = pointInTimeRecoveryEnabled;
+    }
+
+    public int getPointInTimeRecoveryRecoveryPeriodInDays() { return pointInTimeRecoveryRecoveryPeriodInDays; }
+    public void setPointInTimeRecoveryRecoveryPeriodInDays(int pointInTimeRecoveryRecoveryPeriodInDays) {
+        this.pointInTimeRecoveryRecoveryPeriodInDays = pointInTimeRecoveryRecoveryPeriodInDays;
+    }
+
+    public boolean isDeletionProtectionEnabled() { return deletionProtectionEnabled; }
+    public void setDeletionProtectionEnabled(boolean deletionProtectionEnabled) { this.deletionProtectionEnabled = deletionProtectionEnabled; }
+
     public boolean isStreamEnabled() { return streamEnabled; }
     public void setStreamEnabled(boolean streamEnabled) { this.streamEnabled = streamEnabled; }
 
@@ -126,7 +167,58 @@ public class TableDefinition {
     public String getStreamViewType() { return streamViewType; }
     public void setStreamViewType(String streamViewType) { this.streamViewType = streamViewType; }
 
+    public boolean isSseEnabled() { return sseEnabled; }
+    public void setSseEnabled(boolean sseEnabled) { this.sseEnabled = sseEnabled; }
+
+    public String getSseType() { return sseType; }
+    public void setSseType(String sseType) { this.sseType = sseType; }
+
+    public String getKmsMasterKeyArn() { return kmsMasterKeyArn; }
+    public void setKmsMasterKeyArn(String kmsMasterKeyArn) { this.kmsMasterKeyArn = kmsMasterKeyArn; }
+
+    public List<KinesisStreamingDestination> getKinesisStreamingDestinations() {
+        return kinesisStreamingDestinations != null ? kinesisStreamingDestinations : new ArrayList<>();
+    }
+    public void setKinesisStreamingDestinations(List<KinesisStreamingDestination> destinations) {
+        this.kinesisStreamingDestinations = destinations != null ? destinations : new ArrayList<>();
+    }
+
+    public Optional<KinesisStreamingDestination> findKinesisStreamingDestination(String streamArn) {
+        return getKinesisStreamingDestinations().stream()
+                .filter(d -> streamArn.equals(d.getStreamArn()))
+                .findFirst();
+    }
+
     /** Returns the partition key attribute name. */
+    public String getTableId() {
+        if (tableId == null) tableId = java.util.UUID.randomUUID().toString();
+        return tableId;
+    }
+    public void setTableId(String tableId) { this.tableId = tableId; }
+
+    public String getTableClass() { return tableClass; }
+    public void setTableClass(String tableClass) { this.tableClass = tableClass; }
+
+    public List<String> getReplicaRegions() {
+        return replicaRegions != null ? replicaRegions : new ArrayList<>();
+    }
+    public void setReplicaRegions(List<String> replicaRegions) {
+        this.replicaRegions = replicaRegions != null ? replicaRegions : new ArrayList<>();
+    }
+
+    public Integer getOnDemandMaxReadRequestUnits() { return onDemandMaxReadRequestUnits; }
+    public void setOnDemandMaxReadRequestUnits(Integer v) { this.onDemandMaxReadRequestUnits = v; }
+
+    public Integer getOnDemandMaxWriteRequestUnits() { return onDemandMaxWriteRequestUnits; }
+    public void setOnDemandMaxWriteRequestUnits(Integer v) { this.onDemandMaxWriteRequestUnits = v; }
+
+    public String getResourcePolicy() { return resourcePolicy; }
+    public void setResourcePolicy(String resourcePolicy) { this.resourcePolicy = resourcePolicy; }
+
+    public String getResourcePolicyRevisionId() { return resourcePolicyRevisionId; }
+    public void setResourcePolicyRevisionId(String resourcePolicyRevisionId) { this.resourcePolicyRevisionId = resourcePolicyRevisionId; }
+
+    @JsonIgnore
     public String getPartitionKeyName() {
         return keySchema.stream()
                 .filter(k -> "HASH".equals(k.getKeyType()))
@@ -136,12 +228,30 @@ public class TableDefinition {
     }
 
     /** Returns the sort key attribute name, or null if none. */
+    @JsonIgnore
     public String getSortKeyName() {
         return keySchema.stream()
                 .filter(k -> "RANGE".equals(k.getKeyType()))
                 .map(KeySchemaElement::getAttributeName)
                 .findFirst()
                 .orElse(null);
+    }
+
+    /**
+     * Returns all sort key attribute names in key-schema order. For a composite sort key this
+     * contains more than one element; ordering must consider all of them, not just the first.
+     *
+     * <p>{@code @JsonIgnore}d: it is derived from {@code keySchema} (redundant with
+     * {@link #getSortKeyName()}), and without a backing setter Jackson's getter-as-setter
+     * fallback tries to append into the immutable list this method returns, throwing
+     * {@code UnsupportedOperationException} on deserialization whenever the table has a sort key.
+     */
+    @JsonIgnore
+    public List<String> getSortKeyNames() {
+        return keySchema.stream()
+                .filter(k -> "RANGE".equals(k.getKeyType()))
+                .map(KeySchemaElement::getAttributeName)
+                .toList();
     }
 
     public Optional<GlobalSecondaryIndex> findGsi(String indexName) {

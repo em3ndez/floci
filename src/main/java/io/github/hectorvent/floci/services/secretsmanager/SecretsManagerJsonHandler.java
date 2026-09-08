@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.secretsmanager;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.services.secretsmanager.model.Secret;
 import io.github.hectorvent.floci.services.secretsmanager.model.SecretVersion;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -11,11 +12,13 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
-import java.security.SecureRandom;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.StreamSupport;
 
 @ApplicationScoped
 public class SecretsManagerJsonHandler {
@@ -38,18 +41,123 @@ public class SecretsManagerJsonHandler {
             case "DescribeSecret" -> handleDescribeSecret(request, region);
             case "ListSecrets" -> handleListSecrets(request, region);
             case "DeleteSecret" -> handleDeleteSecret(request, region);
+            case "RestoreSecret" -> handleRestoreSecret(request, region);
             case "RotateSecret" -> handleRotateSecret(request, region);
             case "TagResource" -> handleTagResource(request, region);
             case "UntagResource" -> handleUntagResource(request, region);
             case "ListSecretVersionIds" -> handleListSecretVersionIds(request, region);
             case "GetResourcePolicy" -> handleGetResourcePolicy(request, region);
             case "GetRandomPassword" -> handleGetRandomPassword(request, region);
-            case "DeleteResourcePolicy" -> Response.ok(objectMapper.createObjectNode()).build();
-            case "PutResourcePolicy" -> Response.ok(objectMapper.createObjectNode()).build();
+            case "BatchGetSecretValue" -> handleBatchGetSecretValue(request, region);
+            case "DeleteResourcePolicy" -> handleDeleteResourcePolicy(request, region);
+            case "PutResourcePolicy" -> handlePutResourcePolicy(request, region);
+            case "UpdateSecretVersionStage" -> handleUpdateSecretVersionStage(request, region);
             default -> Response.status(400)
                     .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported."))
                     .build();
         };
+    }
+
+    private Response handleBatchGetSecretValue(JsonNode request, String region) {
+        if (!request.has("SecretIdList") && !request.has("Filters")) {
+            return Response.status(400)
+                    .entity(new AwsErrorResponse("InvalidParameterException", "You must specify either SecretIdList or Filters."))
+                    .build();
+        }
+
+        if (request.has("SecretIdList") && request.has("Filters")) {
+            return Response.status(400)
+                    .entity(new AwsErrorResponse("InvalidParameterException", "You cannot specify both SecretIdList and Filters."))
+                    .build();
+        }
+
+        List<SecretsManagerService.BatchSecretValue> values;
+        List<SecretsManagerService.BatchGetSecretValueError> errors = List.of();
+        String nextToken = null;
+
+        if (request.has("SecretIdList")) {
+            List<String> secretIdList = new ArrayList<>();
+            request.path("SecretIdList").forEach(id -> secretIdList.add(id.asText()));
+            SecretsManagerService.BatchGetSecretValueResult result =
+                    service.batchGetSecretValue(secretIdList, region);
+            values = result.values();
+            errors = result.errors();
+        } else {
+            // Validate paging inputs before the service scans and filters the whole store.
+            int maxResults = request.has("MaxResults") ? request.path("MaxResults").asInt() : 20;
+            if (maxResults < 1 || maxResults > 20) {
+                return Response.status(400)
+                        .entity(new AwsErrorResponse("InvalidParameterException", "MaxResults must be between 1 and 20."))
+                        .build();
+            }
+
+            int startIndex = 0;
+            if (request.has("NextToken")) {
+                try {
+                    startIndex = Integer.parseInt(request.path("NextToken").asText());
+                    if (startIndex < 0) {
+                        throw new NumberFormatException("negative NextToken");
+                    }
+                } catch (NumberFormatException e) {
+                    return Response.status(400)
+                            .entity(new AwsErrorResponse("InvalidNextTokenException", "The NextToken value is invalid."))
+                            .build();
+                }
+            }
+
+            List<SecretsManagerService.BatchSecretValue> allFilteredValues =
+                    service.batchGetSecretValueByFilters(parseFilters(request), region);
+
+            if (startIndex > allFilteredValues.size()) {
+                values = List.of();
+            } else {
+                int endIndex = Math.min(startIndex + maxResults, allFilteredValues.size());
+                values = allFilteredValues.subList(startIndex, endIndex);
+                if (endIndex < allFilteredValues.size()) {
+                    nextToken = String.valueOf(endIndex);
+                }
+            }
+        }
+
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode secretValues = objectMapper.createArrayNode();
+        for (SecretsManagerService.BatchSecretValue value : values) {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("ARN", value.arn());
+            node.put("Name", value.name());
+            node.put("VersionId", value.versionId());
+            if (value.secretString() != null) {
+                node.put("SecretString", value.secretString());
+            }
+            if (value.secretBinary() != null) {
+                node.put("SecretBinary", value.secretBinary());
+            }
+            if (value.createdDate() != null) {
+                node.put("CreatedDate", value.createdDate().toEpochMilli() / 1000.0);
+            }
+            ArrayNode stages = objectMapper.createArrayNode();
+            if (value.versionStages() != null) {
+                value.versionStages().forEach(stages::add);
+            }
+            node.set("VersionStages", stages);
+            secretValues.add(node);
+        }
+        response.set("SecretValues", secretValues);
+
+        ArrayNode errorNodes = objectMapper.createArrayNode();
+        for (SecretsManagerService.BatchGetSecretValueError error : errors) {
+            ObjectNode node = objectMapper.createObjectNode();
+            node.put("SecretId", error.secretId());
+            node.put("ErrorCode", error.errorCode());
+            node.put("Message", error.message());
+            errorNodes.add(node);
+        }
+        response.set("Errors", errorNodes);
+
+        if (nextToken != null) {
+            response.put("NextToken", nextToken);
+        }
+        return Response.ok(response).build();
     }
 
     private Response handleCreateSecret(JsonNode request, String region) {
@@ -102,9 +210,14 @@ public class SecretsManagerJsonHandler {
         String secretId = request.path("SecretId").asText();
         String secretString = request.has("SecretString") ? request.path("SecretString").asText() : null;
         String secretBinary = request.has("SecretBinary") ? request.path("SecretBinary").asText() : null;
+        String clientRequestToken = request.has("ClientRequestToken") ? request.path("ClientRequestToken").asText() : null;
+
+        List<String> versionStages = request.has("VersionStages") && request.path("VersionStages").isArray()
+                ? StreamSupport.stream(request.path("VersionStages").spliterator(), false).map(JsonNode::asText).toList()
+                : null;
 
         Secret secret = service.describeSecret(secretId, region);
-        SecretVersion version = service.putSecretValue(secretId, secretString, secretBinary, region);
+        SecretVersion version = service.putSecretValue(secretId, secretString, secretBinary, clientRequestToken, region, versionStages);
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("ARN", secret.getArn());
@@ -127,13 +240,19 @@ public class SecretsManagerJsonHandler {
 
         Secret secret = service.updateSecret(secretId, description, kmsKeyId, region);
 
+        String versionId = null;
         if (secretString != null || secretBinary != null) {
-            service.putSecretValue(secretId, secretString, secretBinary, region);
+            String clientRequestToken = request.has("ClientRequestToken") ? request.path("ClientRequestToken").asText() : java.util.UUID.randomUUID().toString();
+            SecretVersion version = service.putSecretValue(secretId, secretString, secretBinary, clientRequestToken, region, null);
+            versionId = version.getVersionId();
         }
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("ARN", secret.getArn());
         response.put("Name", secret.getName());
+        if (versionId != null) {
+            response.put("VersionId", versionId);
+        }
         return Response.ok(response).build();
     }
 
@@ -147,7 +266,34 @@ public class SecretsManagerJsonHandler {
         if (secret.getDescription() != null) {
             response.put("Description", secret.getDescription());
         }
+        if (secret.getKmsKeyId() != null) {
+            response.put("KmsKeyId", secret.getKmsKeyId());
+        }
         response.put("RotationEnabled", secret.isRotationEnabled());
+        if (secret.getRotationLambdaArn() != null) {
+            response.put("RotationLambdaARN", secret.getRotationLambdaArn());
+        }
+        if (secret.getRotationRules() != null) {
+            ObjectNode rulesNode = objectMapper.createObjectNode();
+            if (secret.getRotationRules().automaticallyAfterDays() != null) rulesNode.put("AutomaticallyAfterDays", secret.getRotationRules().automaticallyAfterDays());
+            if (secret.getRotationRules().duration() != null) rulesNode.put("Duration", secret.getRotationRules().duration());
+            if (secret.getRotationRules().scheduleExpression() != null) rulesNode.put("ScheduleExpression", secret.getRotationRules().scheduleExpression());
+            response.set("RotationRules", rulesNode);
+        }
+        if (secret.getLastRotatedDate() != null) {
+            response.put("LastRotatedDate", secret.getLastRotatedDate().toEpochMilli() / 1000.0);
+        }
+        
+        Instant nextRotationDate = secret.getNextRotationDate();
+        if (nextRotationDate == null && secret.isRotationEnabled() && secret.getRotationRules() != null && secret.getRotationRules().automaticallyAfterDays() != null) {
+            Instant lastRotated = secret.getLastRotatedDate() != null ? secret.getLastRotatedDate() : secret.getCreatedDate();
+            if (lastRotated != null) {
+                nextRotationDate = lastRotated.plusSeconds((long) secret.getRotationRules().automaticallyAfterDays() * 86400);
+            }
+        }
+        if (nextRotationDate != null) {
+            response.put("NextRotationDate", nextRotationDate.toEpochMilli() / 1000.0);
+        }
         if (secret.getCreatedDate() != null) {
             response.put("CreatedDate", secret.getCreatedDate().toEpochMilli() / 1000.0);
         }
@@ -156,6 +302,9 @@ public class SecretsManagerJsonHandler {
         }
         if (secret.getDeletedDate() != null) {
             response.put("DeletedDate", secret.getDeletedDate().toEpochMilli() / 1000.0);
+        }
+        if (secret.getOwningService() != null) {
+            response.put("OwningService", secret.getOwningService());
         }
 
         ArrayNode tagsArray = objectMapper.createArrayNode();
@@ -184,20 +333,82 @@ public class SecretsManagerJsonHandler {
         return Response.ok(response).build();
     }
 
+    /** Parses the request's {@code Filters} array, shared by BatchGetSecretValue and ListSecrets. */
+    private List<SecretsManagerService.Filter> parseFilters(JsonNode request) {
+        List<SecretsManagerService.Filter> filters = new ArrayList<>();
+        JsonNode filtersNode = request.path("Filters");
+        if (filtersNode.isArray()) {
+            for (JsonNode f : filtersNode) {
+                String key = f.path("Key").asText();
+                List<String> filterValues = new ArrayList<>();
+                f.path("Values").forEach(v -> filterValues.add(v.asText()));
+                filters.add(new SecretsManagerService.Filter(key, filterValues));
+            }
+        }
+        return filters;
+    }
+
     private Response handleListSecrets(JsonNode request, String region) {
-        List<Secret> secrets = service.listSecrets(region);
+        List<Secret> secrets = new ArrayList<>(service.listSecrets(region, parseFilters(request)));
+        // AWS lists secrets by CreatedDate when SortBy is absent; sort on it (name as a
+        // tiebreaker) for AWS-matching, stable pagination across calls.
+        secrets.sort(Comparator.comparing(Secret::getCreatedDate, Comparator.nullsLast(Comparator.naturalOrder()))
+                .thenComparing(Secret::getName));
+
+        // MaxResults is constrained to 1-100; when absent the full result set is returned.
+        int maxResults = secrets.size();
+        if (request.hasNonNull("MaxResults")) {
+            maxResults = request.path("MaxResults").asInt();
+            if (maxResults < 1 || maxResults > 100) {
+                return Response.status(400)
+                        .entity(new AwsErrorResponse("InvalidParameterException",
+                                "Invalid MaxResults value, must be between 1 and 100"))
+                        .build();
+            }
+        }
+
+        // NextToken is an opaque offset into the sorted secret list.
+        int offset = 0;
+        if (request.hasNonNull("NextToken")) {
+            try {
+                offset = Integer.parseInt(request.path("NextToken").asText());
+                if (offset < 0) {
+                    throw new NumberFormatException();
+                }
+            } catch (NumberFormatException e) {
+                return Response.status(400)
+                        .entity(new AwsErrorResponse("InvalidNextTokenException", "Invalid NextToken"))
+                        .build();
+            }
+        }
+        offset = Math.min(offset, secrets.size());
+        int end = Math.min(secrets.size(), offset + maxResults);
+        List<Secret> page = secrets.subList(offset, end);
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode secretList = objectMapper.createArrayNode();
-        for (Secret secret : secrets) {
+        for (Secret secret : page) {
             ObjectNode node = objectMapper.createObjectNode();
             node.put("ARN", secret.getArn());
             node.put("Name", secret.getName());
             if (secret.getDescription() != null) {
                 node.put("Description", secret.getDescription());
             }
+            if (secret.getKmsKeyId() != null) {
+                node.put("KmsKeyId", secret.getKmsKeyId());
+            }
+            node.put("RotationEnabled", secret.isRotationEnabled());
+            if (secret.getCreatedDate() != null) {
+                node.put("CreatedDate", secret.getCreatedDate().toEpochMilli() / 1000.0);
+            }
             if (secret.getLastChangedDate() != null) {
                 node.put("LastChangedDate", secret.getLastChangedDate().toEpochMilli() / 1000.0);
+            }
+            if (secret.getLastAccessedDate() != null) {
+                node.put("LastAccessedDate", secret.getLastAccessedDate().toEpochMilli() / 1000.0);
+            }
+            if (secret.getOwningService() != null) {
+                node.put("OwningService", secret.getOwningService());
             }
             ArrayNode tagsArray = objectMapper.createArrayNode();
             if (secret.getTags() != null) {
@@ -212,6 +423,9 @@ public class SecretsManagerJsonHandler {
             secretList.add(node);
         }
         response.set("SecretList", secretList);
+        if (end < secrets.size()) {
+            response.put("NextToken", String.valueOf(end));
+        }
         return Response.ok(response).build();
     }
 
@@ -232,22 +446,51 @@ public class SecretsManagerJsonHandler {
         return Response.ok(response).build();
     }
 
-    private Response handleRotateSecret(JsonNode request, String region) {
+    private Response handleRestoreSecret(JsonNode request, String region) {
         String secretId = request.path("SecretId").asText();
-        String lambdaArn = request.has("RotationLambdaARN") ? request.path("RotationLambdaARN").asText() : null;
-        boolean rotateImmediately = request.path("RotateImmediately").asBoolean(true);
-
-        Map<String, Integer> rules = new HashMap<>();
-        JsonNode rulesNode = request.path("RotationRules");
-        if (rulesNode.has("AutomaticallyAfterDays")) {
-            rules.put("AutomaticallyAfterDays", rulesNode.path("AutomaticallyAfterDays").asInt());
-        }
-
-        Secret secret = service.rotateSecret(secretId, lambdaArn, rules, rotateImmediately, region);
+        Secret secret = service.restoreSecret(secretId, region);
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("ARN", secret.getArn());
         response.put("Name", secret.getName());
+        return Response.ok(response).build();
+    }
+
+    private Response handleRotateSecret(JsonNode request, String region) {
+        String secretId = request.path("SecretId").asText();
+        String clientRequestToken = request.has("ClientRequestToken") ? request.path("ClientRequestToken").asText() : java.util.UUID.randomUUID().toString();
+        
+        String lambdaArn = request.has("RotationLambdaARN") ? request.path("RotationLambdaARN").asText() : null;
+                          
+        boolean rotateImmediately = true;
+        if (request.has("RotateImmediately")) {
+            rotateImmediately = request.path("RotateImmediately").asBoolean();
+        }
+
+        Secret.RotationRules rotationRules = null;
+        JsonNode rulesNode = request.has("RotationRules") ? request.path("RotationRules") : null;
+        
+        if (rulesNode != null && !rulesNode.isNull()) {
+            Integer automaticallyAfterDays = null;
+            if (rulesNode.hasNonNull("AutomaticallyAfterDays")) {
+                automaticallyAfterDays = rulesNode.path("AutomaticallyAfterDays").asInt();
+            }
+            
+            String duration = rulesNode.hasNonNull("Duration") ? rulesNode.path("Duration").asText() : null;
+            String scheduleExpression = rulesNode.hasNonNull("ScheduleExpression") ? rulesNode.path("ScheduleExpression").asText() : null;
+            rotationRules = new Secret.RotationRules(automaticallyAfterDays, duration, scheduleExpression);
+        }
+
+        Secret secret = service.rotateSecret(secretId, clientRequestToken, lambdaArn, rotationRules, rotateImmediately, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("ARN", secret.getArn());
+        response.put("Name", secret.getName());
+        // A service-managed secret is rotated in place by its owning service, staging no version
+        // for the request token, so report the version that exists rather than one that would
+        // resolve to nothing.
+        boolean serviceManaged = secret.getOwningService() != null && secret.getCurrentVersionId() != null;
+        response.put("VersionId", serviceManaged ? secret.getCurrentVersionId() : clientRequestToken);
         return Response.ok(response).build();
     }
 
@@ -296,7 +539,55 @@ public class SecretsManagerJsonHandler {
 
     private Response handleGetResourcePolicy(JsonNode request, String region) {
         String secretId = request.path("SecretId").asText();
-        Secret secret = service.describeSecret(secretId, region);
+        Secret secret = service.getResourcePolicy(secretId, region);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("ARN", secret.getArn());
+        response.put("Name", secret.getName());
+        // AWS omits ResourcePolicy entirely when no policy is attached; the terraform provider
+        // reads the absent field as "no policy" rather than as an error.
+        if (secret.getResourcePolicy() != null) {
+            response.put("ResourcePolicy", secret.getResourcePolicy());
+        }
+        return Response.ok(response).build();
+    }
+
+    // BlockPublicPolicy is accepted but not enforced: the emulator does no public-policy
+    // analysis, so PublicPolicyException is never raised.
+    private Response handlePutResourcePolicy(JsonNode request, String region) {
+        String secretId = request.path("SecretId").asText();
+        String resourcePolicy = request.hasNonNull("ResourcePolicy") ? request.get("ResourcePolicy").asText() : null;
+        if (resourcePolicy == null || resourcePolicy.isBlank()) {
+            return Response.status(400)
+                    .entity(new AwsErrorResponse("InvalidParameterException",
+                            "Invalid parameter: ResourcePolicy must not be null or empty."))
+                    .build();
+        }
+
+        JsonNode parsedPolicy;
+        try {
+            parsedPolicy = objectMapper.readTree(resourcePolicy);
+        } catch (JsonProcessingException e) {
+            parsedPolicy = null;
+        }
+        if (parsedPolicy == null || !parsedPolicy.isObject()) {
+            return Response.status(400)
+                    .entity(new AwsErrorResponse("MalformedPolicyDocumentException",
+                            "The resource policy is not a valid JSON policy document."))
+                    .build();
+        }
+
+        Secret secret = service.putResourcePolicy(secretId, resourcePolicy, region);
+        ObjectNode response = objectMapper.createObjectNode();
+        // The terraform provider uses the returned ARN as the aws_secretsmanager_secret_policy
+        // resource id, so an empty response breaks its create outright.
+        response.put("ARN", secret.getArn());
+        response.put("Name", secret.getName());
+        return Response.ok(response).build();
+    }
+
+    private Response handleDeleteResourcePolicy(JsonNode request, String region) {
+        String secretId = request.path("SecretId").asText();
+        Secret secret = service.deleteResourcePolicy(secretId, region);
         ObjectNode response = objectMapper.createObjectNode();
         response.put("ARN", secret.getArn());
         response.put("Name", secret.getName());
@@ -325,97 +616,30 @@ public class SecretsManagerJsonHandler {
      * @see <a href="https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetRandomPassword.html">AWS Secrets Manager – GetRandomPassword</a>
      */
     private Response handleGetRandomPassword(JsonNode request, String region) {
-
-        var excludeCharacters = request.get("ExcludeCharacters");
-        var excludeLowerCase = request.get("ExcludeLowercase");
-        var excludeNumbers = request.get("ExcludeNumbers");
-        var excludePunctuation = request.get("ExcludePunctuation");
-        var excludeUpperCase = request.get("ExcludeUppercase");
-        var includeSpace = request.get("IncludeSpace");
-        var passwordLength = request.get("PasswordLength");
-        var requireEachIncludedType = request.get("RequireEachIncludedType");
-
-        int length = (passwordLength != null && !passwordLength.isNull()) ? passwordLength.asInt(32) : 32;
-        if (length < 1 || length > 4096) {
+        try {
+            String password = RandomPasswordGenerator.generate(request);
+            ObjectNode response = objectMapper.createObjectNode();
+            response.put("RandomPassword", password);
+            return Response.ok(response).build();
+        } catch (IllegalArgumentException e) {
             return Response.status(400)
-                    .entity(new AwsErrorResponse("InvalidParameterException", "PasswordLength must be between 1 and 4096."))
+                    .entity(new AwsErrorResponse("InvalidParameterException", e.getMessage()))
                     .build();
         }
+    }
 
-        StringBuilder charset = new StringBuilder();
-        if (excludeLowerCase == null || excludeLowerCase.isNull() || !excludeLowerCase.asBoolean()) {
-            charset.append("abcdefghijklmnopqrstuvwxyz");
-        }
-        if (excludeUpperCase == null || excludeUpperCase.isNull() || !excludeUpperCase.asBoolean()) {
-            charset.append("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
-        }
-        if (excludeNumbers == null || excludeNumbers.isNull() || !excludeNumbers.asBoolean()) {
-            charset.append("0123456789");
-        }
-        if (excludePunctuation == null || excludePunctuation.isNull() || !excludePunctuation.asBoolean()) {
-            charset.append("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~");
-        }
-        if (includeSpace != null && !includeSpace.isNull() && includeSpace.asBoolean()) {
-            charset.append(" ");
-        }
-        if (excludeCharacters != null && !excludeCharacters.isNull()) {
-            String excluded = excludeCharacters.asText();
-            for (int i = charset.length() - 1; i >= 0; i--) {
-                if (excluded.indexOf(charset.charAt(i)) >= 0) {
-                    charset.deleteCharAt(i);
-                }
-            }
-        }
+    private Response handleUpdateSecretVersionStage(JsonNode request, String region) {
+        String secretId = request.path("SecretId").asText();
+        String moveToVersionId = request.path("MoveToVersionId").asText(null);
+        String removeFromVersionId = request.path("RemoveFromVersionId").asText(null);
+        String versionStage = request.path("VersionStage").asText();
 
-        SecureRandom random = new SecureRandom();
-        StringBuilder password = new StringBuilder(length);
-
-        boolean requireEach = requireEachIncludedType == null || requireEachIncludedType.isNull() || requireEachIncludedType.asBoolean();
-        if (requireEach) {
-            List<String> includedTypes = new ArrayList<>();
-            if (excludeLowerCase == null || excludeLowerCase.isNull() || !excludeLowerCase.asBoolean()) {
-                includedTypes.add("abcdefghijklmnopqrstuvwxyz");
-            }
-            if (excludeUpperCase == null || excludeUpperCase.isNull() || !excludeUpperCase.asBoolean()) {
-                includedTypes.add("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
-            }
-            if (excludeNumbers == null || excludeNumbers.isNull() || !excludeNumbers.asBoolean()) {
-                includedTypes.add("0123456789");
-            }
-            if (excludePunctuation == null || excludePunctuation.isNull() || !excludePunctuation.asBoolean()) {
-                includedTypes.add("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~");
-            }
-            if (includeSpace != null && !includeSpace.isNull() && includeSpace.asBoolean()) {
-                includedTypes.add(" ");
-            }
-            if (excludeCharacters != null && !excludeCharacters.isNull()) {
-                String excluded = excludeCharacters.asText();
-                includedTypes = includedTypes.stream()
-                        .map(t -> t.chars().filter(c -> excluded.indexOf(c) < 0)
-                                .collect(StringBuilder::new, StringBuilder::appendCodePoint, StringBuilder::append).toString())
-                        .filter(t -> !t.isEmpty())
-                        .collect(java.util.stream.Collectors.toList());
-            }
-            // Seed one char from each required type
-            for (String type : includedTypes) {
-                password.append(type.charAt(random.nextInt(type.length())));
-            }
-        }
-
-        for (int i = password.length(); i < length; i++) {
-            password.append(charset.charAt(random.nextInt(charset.length())));
-        }
-
-        // Shuffle so required chars aren't always at the start
-        for (int i = length - 1; i > 0; i--) {
-            int j = random.nextInt(i + 1);
-            char tmp = password.charAt(i);
-            password.setCharAt(i, password.charAt(j));
-            password.setCharAt(j, tmp);
-        }
+        Secret secret = service.updateSecretVersionStage(secretId,
+                moveToVersionId, removeFromVersionId, versionStage, region);
 
         ObjectNode response = objectMapper.createObjectNode();
-        response.put("RandomPassword", password.toString());
+        response.put("ARN", secret.getArn());
+        response.put("Name", secret.getName());
         return Response.ok(response).build();
     }
 

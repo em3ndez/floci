@@ -1,30 +1,30 @@
 package io.github.hectorvent.floci.services.elasticache.container;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
-import io.github.hectorvent.floci.services.lambda.launcher.DockerHostResolver;
-import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
-import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.async.ResultCallback;
-import com.github.dockerjava.api.command.CreateContainerResponse;
-import com.github.dockerjava.api.model.ExposedPort;
-import com.github.dockerjava.api.model.Frame;
-import com.github.dockerjava.api.model.HostConfig;
-import com.github.dockerjava.api.model.Ports;
+import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
+import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.io.Closeable;
 import java.io.IOException;
-import java.net.ServerSocket;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Manages backend Docker container lifecycle for ElastiCache replication groups.
@@ -36,208 +36,256 @@ public class ElastiCacheContainerManager {
 
     private static final Logger LOG = Logger.getLogger(ElastiCacheContainerManager.class);
     private static final int BACKEND_PORT = 6379;
-    private static final String HOST_DOCKER_INTERNAL = "host.docker.internal";
-    private static final DateTimeFormatter LOG_STREAM_DATE_FMT = DateTimeFormatter.ofPattern("yyyy/MM/dd");
 
-    private final DockerClient dockerClient;
-    private final ImageCacheService imageCacheService;
-    private final DockerHostResolver dockerHostResolver;
+    /**
+     * Docker can publish a host port before Valkey inside the container is listening. Without a probe,
+     * the auth proxy may connect, forward PING, and block on PONG until the client times out.
+     */
+    private static final int BACKEND_READY_DEADLINE_MS = 60_000;
+    private static final int BACKEND_READY_RETRY_MS = 100;
+    private static final int BACKEND_PROBE_CONNECT_MS = 2_000;
+    private static final byte[] RESP_PING = "*1\r\n$4\r\nPING\r\n".getBytes(StandardCharsets.UTF_8);
+
+    private final ContainerBuilder containerBuilder;
+    private final ContainerLifecycleManager lifecycleManager;
+    private final ContainerLogStreamer logStreamer;
+    private final ContainerDetector containerDetector;
     private final EmulatorConfig config;
-    private final CloudWatchLogsService cloudWatchLogsService;
     private final RegionResolver regionResolver;
+    private final Map<String, ElastiCacheContainerHandle> activeContainers = new ConcurrentHashMap<>();
+    private volatile boolean dockerUnavailableLogged;
 
     @Inject
-    public ElastiCacheContainerManager(DockerClient dockerClient,
-                                       ImageCacheService imageCacheService,
-                                       DockerHostResolver dockerHostResolver,
+    public ElastiCacheContainerManager(ContainerBuilder containerBuilder,
+                                       ContainerLifecycleManager lifecycleManager,
+                                       ContainerLogStreamer logStreamer,
+                                       ContainerDetector containerDetector,
                                        EmulatorConfig config,
-                                       CloudWatchLogsService cloudWatchLogsService,
                                        RegionResolver regionResolver) {
-        this.dockerClient = dockerClient;
-        this.imageCacheService = imageCacheService;
-        this.dockerHostResolver = dockerHostResolver;
+        this.containerBuilder = containerBuilder;
+        this.lifecycleManager = lifecycleManager;
+        this.logStreamer = logStreamer;
+        this.containerDetector = containerDetector;
         this.config = config;
-        this.cloudWatchLogsService = cloudWatchLogsService;
         this.regionResolver = regionResolver;
     }
 
+    /**
+     * Attempts {@link #start} and reports the backend as unavailable instead of propagating the
+     * failure, when the cause is that no Docker daemon is reachable from Floci: Floci running
+     * inside Docker without a mounted socket, or a stopped daemon on the host. A failure raised
+     * while the daemon <em>is</em> reachable is a genuine container problem and still propagates,
+     * so nothing changes for a Floci that can start Valkey containers.
+     *
+     * @return the container handle, or {@code null} when no Docker daemon is reachable and no
+     *         container was created
+     */
+    public ElastiCacheContainerHandle tryStart(String groupId, String image) {
+        try {
+            ElastiCacheContainerHandle handle = start(groupId, image);
+            dockerUnavailableLogged = false;
+            return handle;
+        } catch (RuntimeException e) {
+            if (isDockerReachable()) {
+                throw e;
+            }
+            boolean partial = activeContainers.containsKey(groupId);
+            stopByGroupId(groupId);
+            if (partial) {
+                throw e;
+            }
+            if (!dockerUnavailableLogged) {
+                dockerUnavailableLogged = true;
+                LOG.warnv("No Docker daemon is reachable from Floci ({0}). ElastiCache metadata "
+                        + "operations keep working and replication groups still reach 'available', "
+                        + "but they have no backing Valkey container until a daemon becomes "
+                        + "reachable.", e.getMessage());
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Probes the configured Docker endpoint, which is how a missing daemon is told apart from a
+     * container that failed for its own reasons.
+     */
+    public boolean isDockerReachable() {
+        try {
+            lifecycleManager.getDockerClient().pingCmd().exec();
+            return true;
+        } catch (Exception e) {
+            LOG.debugv("Docker daemon is not reachable: {0}", e.getMessage());
+            return false;
+        }
+    }
+
     public ElastiCacheContainerHandle start(String groupId, String image) {
+        return start(groupId, image, List.of());
+    }
+
+    /**
+     * Starts a backend container for the given resource id, appending {@code extraServerFlags}
+     * to the Valkey server command line (via the image's {@code VALKEY_EXTRA_FLAGS} hook).
+     * Cluster-mode nodes use this to pass {@code --cluster-enabled} and announce settings.
+     */
+    public ElastiCacheContainerHandle start(String groupId, String image, List<String> extraServerFlags) {
         LOG.infov("Starting ElastiCache backend container for group: {0}", groupId);
-        imageCacheService.ensureImageExists(image);
 
-        boolean nativeMode = HOST_DOCKER_INTERNAL.equals(dockerHostResolver.resolve());
+        String containerName = containerName(groupId);
 
-        HostConfig hostConfig = buildHostConfig(nativeMode);
-        String containerName = "floci-valkey-" + groupId;
+        // Remove any stale container with the same name
+        lifecycleManager.removeIfExists(containerName);
 
-        config.services().elasticache().dockerNetwork()
-                .or(() -> config.services().dockerNetwork())
-                .ifPresent(network -> {
-                    if (!network.isBlank()) {
-                        hostConfig.withNetworkMode(network);
-                        LOG.debugv("Attaching ElastiCache container to network: {0}", network);
-                    }
-                });
-
-        CreateContainerResponse container = dockerClient.createContainerCmd(image)
-                .withName(containerName)
-                .withEnv(List.of("VALKEY_EXTRA_FLAGS=--loglevel verbose"))
-                .withExposedPorts(ExposedPort.tcp(BACKEND_PORT))
-                .withHostConfig(hostConfig)
-                .exec();
-
-        String containerId = container.getId();
-        LOG.infov("Created ElastiCache container {0} for group {1}", containerId, groupId);
-
-        dockerClient.startContainerCmd(containerId).exec();
-        LOG.infov("Started ElastiCache container {0}", containerId);
-
-        String backendHost;
-        int backendPort;
-
-        if (nativeMode) {
-            // Retrieve the actual allocated host port from the container inspect
-            var inspect = dockerClient.inspectContainerCmd(containerId).exec();
-            var bindings = inspect.getNetworkSettings().getPorts().getBindings();
-            var binding = bindings.get(ExposedPort.tcp(BACKEND_PORT));
-            if (binding != null && binding.length > 0) {
-                backendPort = Integer.parseInt(binding[0].getHostPortSpec());
-            } else {
-                backendPort = BACKEND_PORT;
-            }
-            backendHost = "localhost";
-        } else {
-            // Docker mode: use container IP on the docker network
-            var inspect = dockerClient.inspectContainerCmd(containerId).exec();
-            var networks = inspect.getNetworkSettings().getNetworks();
-            String containerIp = null;
-            if (networks != null) {
-                for (Map.Entry<String, ?> entry : networks.entrySet()) {
-                    var netEntry = (com.github.dockerjava.api.model.ContainerNetwork) entry.getValue();
-                    containerIp = netEntry.getIpAddress();
-                    if (containerIp != null && !containerIp.isBlank()) {
-                        break;
-                    }
-                }
-            }
-            if (containerIp == null || containerIp.isBlank()) {
-                containerIp = inspect.getNetworkSettings().getIpAddress();
-            }
-            backendHost = containerIp;
-            backendPort = BACKEND_PORT;
+        StringBuilder serverFlags = new StringBuilder("--loglevel verbose");
+        for (String flag : extraServerFlags) {
+            serverFlags.append(' ').append(flag);
         }
 
-        LOG.infov("ElastiCache backend for group {0}: {1}:{2}", groupId, backendHost, backendPort);
+        // Build container spec. Only publish the backend port to the host in
+        // native mode — in Docker mode the JVM reaches the container via its
+        // network IP, no host binding needed.
+        ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image)
+                .withName(containerName)
+                .withEnv("VALKEY_EXTRA_FLAGS", serverFlags.toString())
+                .withDockerNetwork(config.services().elasticache().dockerNetwork())
+                .withLogRotation()
+                .withLabels(ContainerStorageHelper.resourceIdentityLabels(
+                        "elasticache", groupId, regionResolver.getAccountId(), regionResolver.getDefaultRegion()));
+
+        if (!containerDetector.isRunningInContainer()) {
+            specBuilder.withDynamicPort(BACKEND_PORT);
+        } else {
+            specBuilder.withExposedPort(BACKEND_PORT);
+        }
+
+        ContainerSpec spec = specBuilder.build();
+
+        // Create and start container
+        ContainerInfo info = lifecycleManager.createAndStart(spec);
+        EndpointInfo endpoint = info.getEndpoint(BACKEND_PORT);
+
+        LOG.infov("ElastiCache backend for group {0}: {1}", groupId, endpoint);
 
         ElastiCacheContainerHandle handle = new ElastiCacheContainerHandle(
-                containerId, groupId, backendHost, backendPort);
+                info.containerId(), groupId, endpoint.host(), endpoint.port());
+        try {
+            handle.setNetworkIp(lifecycleManager.resolveContainerNetworkIp(
+                    info.containerId(), config.services().elasticache().dockerNetwork().orElse(null)));
+        } catch (RuntimeException e) {
+            LOG.warnv("Could not resolve network IP for ElastiCache container {0}: {1}",
+                    info.containerId(), e.getMessage());
+        }
+        activeContainers.put(groupId, handle);
 
-        String shortId = containerId.length() >= 8 ? containerId.substring(0, 8) : containerId;
-        attachLogStream(handle, groupId, containerId, shortId);
+        // Attach log streaming
+        String shortId = info.containerId().length() >= 8
+                ? info.containerId().substring(0, 8)
+                : info.containerId();
+        String logGroup = "/aws/elasticache/cluster/" + groupId + "/engine-log";
+        String logStream = logStreamer.generateLogStreamName(shortId);
+        String region = regionResolver.getDefaultRegion();
+
+        Closeable logHandle = logStreamer.attach(
+                info.containerId(), logGroup, logStream, region, "elasticache:" + groupId);
+        handle.setLogStream(logHandle);
+
+        waitForBackendReady(groupId, endpoint.host(), endpoint.port());
 
         return handle;
+    }
+
+    private static void waitForBackendReady(String groupId, String host, int port) {
+        long deadline = System.currentTimeMillis() + BACKEND_READY_DEADLINE_MS;
+        int attempt = 0;
+        while (System.currentTimeMillis() < deadline) {
+            attempt++;
+            try (Socket s = new Socket()) {
+                s.connect(new InetSocketAddress(host, port), BACKEND_PROBE_CONNECT_MS);
+                s.setTcpNoDelay(true);
+                s.setSoTimeout(BACKEND_PROBE_CONNECT_MS);
+                OutputStream out = s.getOutputStream();
+                out.write(RESP_PING);
+                out.flush();
+                String line = readAsciiLineCrLf(s.getInputStream());
+                if (line.startsWith("+PONG")) {
+                    if (attempt > 1) {
+                        LOG.infov("ElastiCache backend ready for group {0} after {1} probe attempt(s)", groupId, attempt);
+                    }
+                    return;
+                }
+                if (LOG.isDebugEnabled()) {
+                    LOG.debugv("ElastiCache backend probe for group {0}: unexpected line {1}", groupId, line);
+                }
+            } catch (IOException e) {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debugv("ElastiCache backend probe for group {0} attempt {1}: {2}", groupId, attempt, e.getMessage());
+                }
+            }
+            try {
+                Thread.sleep(BACKEND_READY_RETRY_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted while waiting for ElastiCache backend " + groupId, ie);
+            }
+        }
+        throw new RuntimeException(
+                "ElastiCache backend for group " + groupId + " did not become ready on " + host + ":" + port
+                        + " within " + BACKEND_READY_DEADLINE_MS + "ms");
+    }
+
+    private static String readAsciiLineCrLf(InputStream in) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        int b;
+        while ((b = in.read()) != -1) {
+            if (b == '\r') {
+                int next = in.read();
+                if (next != '\n') {
+                    throw new IOException("Expected \\n after \\r in RESP line");
+                }
+                break;
+            }
+            sb.append((char) b);
+        }
+        return sb.toString();
     }
 
     public void stop(ElastiCacheContainerHandle handle) {
         if (handle == null) {
             return;
         }
-        LOG.infov("Stopping ElastiCache container {0}", handle.getContainerId());
-
-        if (handle.getLogStream() != null) {
-            try { handle.getLogStream().close(); } catch (Exception ignored) {}
-        }
-
-        try {
-            dockerClient.stopContainerCmd(handle.getContainerId()).withTimeout(5).exec();
-        } catch (Exception e) {
-            LOG.warnv("Error stopping ElastiCache container {0}: {1}",
-                    handle.getContainerId(), e.getMessage());
-        }
-
-        try {
-            dockerClient.removeContainerCmd(handle.getContainerId()).withForce(true).exec();
-        } catch (Exception e) {
-            LOG.warnv("Error removing ElastiCache container {0}: {1}",
-                    handle.getContainerId(), e.getMessage());
-        }
+        activeContainers.remove(handle.getGroupId());
+        lifecycleManager.stopAndRemove(handle.getContainerId(), handle.getLogStream());
     }
 
-    private HostConfig buildHostConfig(boolean nativeMode) {
-        HostConfig hostConfig = HostConfig.newHostConfig();
-        if (nativeMode) {
-            // Bind BACKEND_PORT → random host port so the JVM can reach the container
-            int freePort = findFreePort();
-            Ports portBindings = new Ports();
-            portBindings.bind(ExposedPort.tcp(BACKEND_PORT), Ports.Binding.bindPort(freePort));
-            hostConfig.withPortBindings(portBindings);
-            LOG.debugv("Native mode: binding container port 6379 → host port {0}", freePort);
+    /**
+     * Stops and removes the backend container for a group by id, if one exists.
+     * Used by the service's provisioning rollback: {@link #start} registers the container in
+     * {@code activeContainers} <em>before</em> {@link #waitForBackendReady}, so a readiness
+     * timeout throws without ever returning the handle to the caller. In that case rollback
+     * can't go through {@link #stop} (it has no handle), so it cleans up by id instead. Falls
+     * back to the deterministic container name to catch a container that failed before it was
+     * registered. Idempotent — a no-op when nothing is running for the id.
+     */
+    public void stopByGroupId(String groupId) {
+        ElastiCacheContainerHandle handle = activeContainers.get(groupId);
+        if (handle != null) {
+            stop(handle);
+            return;
         }
-        return hostConfig;
+        lifecycleManager.removeIfExists(containerName(groupId));
     }
 
-    private static int findFreePort() {
-        try (ServerSocket s = new ServerSocket(0)) {
-            s.setReuseAddress(true);
-            return s.getLocalPort();
-        } catch (IOException e) {
-            throw new RuntimeException("Could not find a free port for ElastiCache container", e);
-        }
+    private String containerName(String groupId) {
+        return ContainerStorageHelper.resourceName(config, "valkey", null, groupId);
     }
 
-    private void attachLogStream(ElastiCacheContainerHandle handle, String groupId,
-                                  String containerId, String shortId) {
-        String logGroup = "/aws/elasticache/cluster/" + groupId + "/engine-log";
-        String region = regionResolver.getDefaultRegion();
-        String logStream = LOG_STREAM_DATE_FMT.format(LocalDate.now()) + "/" + shortId;
-        ensureLogGroupAndStream(logGroup, logStream, region);
-
-        try {
-            ResultCallback.Adapter<Frame> logCallback = dockerClient.logContainerCmd(containerId)
-                    .withStdOut(true)
-                    .withStdErr(true)
-                    .withFollowStream(true)
-                    .withTimestamps(false)
-                    .exec(new ResultCallback.Adapter<>() {
-                        @Override
-                        public void onNext(Frame frame) {
-                            String line = new String(frame.getPayload(), StandardCharsets.UTF_8).stripTrailing();
-                            if (!line.isEmpty()) {
-                                LOG.infov("[elasticache:{0}] {1}", groupId, line);
-                                forwardToCloudWatchLogs(logGroup, logStream, region, line);
-                            }
-                        }
-                    });
-            handle.setLogStream(logCallback);
-        } catch (Exception e) {
-            LOG.warnv("Could not attach log stream for ElastiCache container {0}: {1}",
-                    containerId, e.getMessage());
+    public void stopAll() {
+        List<ElastiCacheContainerHandle> handles = new ArrayList<>(activeContainers.values());
+        if (!handles.isEmpty()) {
+            LOG.infov("Stopping {0} ElastiCache container(s) on shutdown", handles.size());
         }
-    }
-
-    private void ensureLogGroupAndStream(String logGroup, String logStream, String region) {
-        try {
-            cloudWatchLogsService.createLogGroup(logGroup, null, null, region);
-        } catch (AwsException ignored) {
-        } catch (Exception e) {
-            LOG.warnv("Could not create CW log group {0}: {1}", logGroup, e.getMessage());
-        }
-        try {
-            cloudWatchLogsService.createLogStream(logGroup, logStream, region);
-        } catch (AwsException ignored) {
-        } catch (Exception e) {
-            LOG.warnv("Could not create CW log stream {0}/{1}: {2}", logGroup, logStream, e.getMessage());
-        }
-    }
-
-    private void forwardToCloudWatchLogs(String logGroup, String logStream, String region, String line) {
-        try {
-            Map<String, Object> event = new HashMap<>();
-            event.put("timestamp", System.currentTimeMillis());
-            event.put("message", line);
-            cloudWatchLogsService.putLogEvents(logGroup, logStream, List.of(event), region);
-        } catch (Exception e) {
-            LOG.debugv("Could not forward ElastiCache log line to CloudWatch Logs: {0}", e.getMessage());
+        for (ElastiCacheContainerHandle handle : handles) {
+            stop(handle);
         }
     }
 }

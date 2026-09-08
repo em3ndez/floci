@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -17,6 +18,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 /**
  * JSON file-backed persistent storage.
@@ -64,7 +66,7 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
         return store.entrySet().stream()
                 .filter(e -> keyFilter.test(e.getKey()))
                 .map(Map.Entry::getValue)
-                .toList();
+                .collect(Collectors.toCollection(ArrayList::new));
     }
 
     @Override
@@ -89,7 +91,11 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
             store.putAll(data);
             LOG.infov("Loaded {0} entries from {1}", store.size(), filePath);
         } catch (IOException e) {
-            LOG.errorv(e, "Failed to load data from {0}", filePath);
+            // Starting empty here silently drops all persisted state for this store, which can leave
+            // other services (e.g. CloudFormation) referencing resources that now appear missing
+            // (see issue #1634). Quarantine the unreadable file and log loudly so the data loss is
+            // detectable rather than masquerading as an empty store.
+            StorageQuarantine.quarantine(filePath, e, LOG);
         }
     }
 

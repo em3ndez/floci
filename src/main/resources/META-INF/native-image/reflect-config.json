@@ -1,5 +1,65 @@
 [
   {
+    "name": "io.github.hectorvent.floci.services.apigateway.VtlTemplateEngine$InputVariable",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "io.github.hectorvent.floci.services.apigateway.VtlTemplateEngine$UtilVariable",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "io.github.hectorvent.floci.services.apigateway.VtlTemplateEngine$ResponseOverride",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.util.introspection.UberspectImpl",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.util.introspection.TypeConversionHandlerImpl",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.runtime.resource.ResourceManagerImpl",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.runtime.resource.ResourceCacheImpl",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.runtime.ParserPoolImpl",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.runtime.resource.loader.FileResourceLoader",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "org.apache.velocity.runtime.resource.loader.StringResourceLoader",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
     "name": "com.fasterxml.jackson.dataformat.cbor.CBORFactory",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true
@@ -2343,59 +2403,69 @@
     "allDeclaredFields": true
   },
   {
-    "name": "org.bouncycastle.jce.provider.BouncyCastleProvider",
+    "name": "io.github.hectorvent.floci.services.appsync.graphql.AppSyncVtlEngine",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true,
     "allDeclaredFields": true
   },
   {
-    "name": "org.bouncycastle.jcajce.provider.asymmetric.rsa.KeyFactorySpi",
+    "name": "io.github.hectorvent.floci.services.appsync.graphql.AppSyncVtlContext",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
-    "name": "org.bouncycastle.jcajce.provider.asymmetric.ec.KeyFactorySpi$EC",
+    "name": "io.github.hectorvent.floci.services.appsync.graphql.ReturnDirective",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
-    "name": "org.bouncycastle.jcajce.provider.asymmetric.rsa.KeyPairGeneratorSpi",
+    "name": "io.github.hectorvent.floci.services.appsync.graphql.util.AppSyncUtil",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
-    "name": "org.bouncycastle.jcajce.provider.asymmetric.ec.KeyPairGeneratorSpi$EC",
+    "name": "io.github.hectorvent.floci.services.appsync.graphql.util.StrUtil",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
-    "name": "org.bouncycastle.jcajce.provider.digest.SHA256$Digest",
+    "name": "io.github.hectorvent.floci.services.appsync.graphql.util.TimeUtil",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
-    "name": "org.bouncycastle.jcajce.provider.digest.SHA384$Digest",
+    "name": "io.github.hectorvent.floci.services.appsync.graphql.util.MathUtil",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
-    "name": "org.bouncycastle.jcajce.provider.asymmetric.rsa.DigestSignatureSpi$SHA256",
+    "name": "io.github.hectorvent.floci.services.appsync.graphql.util.DynamoDbUtil",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
-    "name": "org.bouncycastle.jcajce.provider.asymmetric.ec.SignatureSpi$ecDSA256",
+    "name": "io.github.hectorvent.floci.services.appsync.graphql.util.TransformUtil",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
-    "name": "org.bouncycastle.jcajce.provider.symmetric.AES$ECB",
+    "name": "io.github.hectorvent.floci.services.appsync.graphql.util.ListUtil",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   },
   {
-    "name": "org.bouncycastle.jcajce.provider.symmetric.PBEPBKDF2$PBKDF2withSHA256",
+    "name": "io.github.hectorvent.floci.services.appsync.graphql.util.MapUtil",
     "allDeclaredConstructors": true,
-    "allDeclaredMethods": true
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
   }
 ]

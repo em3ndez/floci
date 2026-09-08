@@ -3,7 +3,9 @@ package io.github.hectorvent.floci.services.cognito.model;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 @RegisterForReflection
@@ -17,7 +19,12 @@ public class CognitoUser {
     private long creationDate;
     private long lastModifiedDate;
     private String passwordHash;
+    private List<String> passwordHistory = new ArrayList<>();
     private boolean temporaryPassword;
+    private List<String> groupNames = new ArrayList<>();
+    private String srpSalt;
+    private String srpVerifier;
+    private EmailMfaSettings emailMfaSettings;
 
     public CognitoUser() {
         long now = System.currentTimeMillis() / 1000L;
@@ -51,6 +58,27 @@ public class CognitoUser {
     public String getPasswordHash() { return passwordHash; }
     public void setPasswordHash(String passwordHash) { this.passwordHash = passwordHash; }
 
+    public List<String> getPasswordHistory() { return passwordHistory; }
+    public void setPasswordHistory(List<String> passwordHistory) {
+        this.passwordHistory = passwordHistory == null ? new ArrayList<>() : new ArrayList<>(passwordHistory);
+    }
+
     public boolean isTemporaryPassword() { return temporaryPassword; }
     public void setTemporaryPassword(boolean temporaryPassword) { this.temporaryPassword = temporaryPassword; }
+
+    public List<String> getGroupNames() { return groupNames; }
+    public void setGroupNames(List<String> groupNames) { this.groupNames = groupNames == null ? new ArrayList<>() : new ArrayList<>(groupNames); }
+
+    public String getSrpSalt() { return srpSalt; }
+    public void setSrpSalt(String srpSalt) { this.srpSalt = srpSalt; }
+
+    public String getSrpVerifier() { return srpVerifier; }
+    public void setSrpVerifier(String srpVerifier) { this.srpVerifier = srpVerifier; }
+    public EmailMfaSettings getEmailMfaSettings() {
+        return emailMfaSettings;
+    }
+
+    public void setEmailMfaSettings(EmailMfaSettings emailMfaSettings) {
+        this.emailMfaSettings = emailMfaSettings;
+    }
 }

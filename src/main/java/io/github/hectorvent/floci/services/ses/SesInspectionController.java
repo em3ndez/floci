@@ -1,6 +1,5 @@
 package io.github.hectorvent.floci.services.ses;
 
-import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.ses.model.SentEmail;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -25,51 +24,84 @@ import java.util.List;
 public class SesInspectionController {
 
     private final SesService sesService;
-    private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
 
     @Inject
-    public SesInspectionController(SesService sesService, RegionResolver regionResolver,
-                                    ObjectMapper objectMapper) {
+    public SesInspectionController(SesService sesService, ObjectMapper objectMapper) {
         this.sesService = sesService;
-        this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
     }
 
     @GET
-    public Response getEmails(@QueryParam("id") String messageId) {
-        String region = regionResolver.getDefaultRegion();
-        List<SentEmail> emails = sesService.getEmails(region);
+    public Response getEmails(@QueryParam("id") String messageId,
+                              @QueryParam("email") String recipient) {
+        List<SentEmail> emails = sesService.getEmails();
 
         ArrayNode messages = objectMapper.createArrayNode();
         for (SentEmail email : emails) {
             if (messageId != null && !messageId.equals(email.getMessageId())) {
                 continue;
             }
+            if (recipient != null && (email.getToAddresses() == null
+                    || !email.getToAddresses().contains(recipient))) {
+                continue;
+            }
             ObjectNode node = objectMapper.createObjectNode();
             node.put("Id", email.getMessageId());
-            node.put("Region", region);
+            if (email.getRegion() != null) {
+                node.put("Region", email.getRegion());
+            } else {
+                node.putNull("Region");
+            }
             node.put("Source", email.getSource());
 
-            ObjectNode destination = node.putObject("Destination");
-            if (email.getToAddresses() != null) {
-                ArrayNode toArr = destination.putArray("ToAddresses");
-                email.getToAddresses().forEach(toArr::add);
-            }
-            if (email.getCcAddresses() != null) {
-                ArrayNode ccArr = destination.putArray("CcAddresses");
-                email.getCcAddresses().forEach(ccArr::add);
-            }
-            if (email.getBccAddresses() != null) {
-                ArrayNode bccArr = destination.putArray("BccAddresses");
-                email.getBccAddresses().forEach(bccArr::add);
+            if (email.isRaw()) {
+                // LocalStack returns RawData for raw emails, without
+                // Destination / Subject / Body fields.
+                node.put("RawData", email.getRawData());
+            } else {
+                ObjectNode destination = node.putObject("Destination");
+                if (email.getToAddresses() != null && !email.getToAddresses().isEmpty()) {
+                    ArrayNode toArr = destination.putArray("ToAddresses");
+                    email.getToAddresses().forEach(toArr::add);
+                }
+                if (email.getCcAddresses() != null && !email.getCcAddresses().isEmpty()) {
+                    ArrayNode ccArr = destination.putArray("CcAddresses");
+                    email.getCcAddresses().forEach(ccArr::add);
+                }
+                if (email.getBccAddresses() != null && !email.getBccAddresses().isEmpty()) {
+                    ArrayNode bccArr = destination.putArray("BccAddresses");
+                    email.getBccAddresses().forEach(bccArr::add);
+                }
+
+                if (email.getReplyToAddresses() != null && !email.getReplyToAddresses().isEmpty()) {
+                    ArrayNode replyTo = node.putArray("ReplyToAddresses");
+                    email.getReplyToAddresses().forEach(replyTo::add);
+                }
+
+                node.put("Subject", email.getSubject());
+
+                ObjectNode body = node.putObject("Body");
+                if (email.getBodyText() != null) {
+                    body.put("text_part", email.getBodyText());
+                } else {
+                    body.putNull("text_part");
+                }
+                if (email.getBodyHtml() != null) {
+                    body.put("html_part", email.getBodyHtml());
+                } else {
+                    body.putNull("html_part");
+                }
             }
 
-            node.put("Subject", email.getSubject());
-
-            ObjectNode body = node.putObject("Body");
-            body.put("text_part", email.getBody() != null ? email.getBody() : "");
-            body.put("html_part", email.getBody() != null ? email.getBody() : "");
+            if (email.getHeaders() != null && !email.getHeaders().isEmpty()) {
+                ArrayNode headers = node.putArray("Headers");
+                email.getHeaders().forEach(h -> {
+                    ObjectNode ho = headers.addObject();
+                    ho.put("Name", h.name());
+                    ho.put("Value", h.value());
+                });
+            }
 
             if (email.getSentAt() != null) {
                 node.put("Timestamp", email.getSentAt().toString());
@@ -85,8 +117,7 @@ public class SesInspectionController {
 
     @DELETE
     public Response clearEmails() {
-        String region = regionResolver.getDefaultRegion();
-        sesService.clearEmails(region);
+        sesService.clearEmails();
         return Response.ok().build();
     }
 }

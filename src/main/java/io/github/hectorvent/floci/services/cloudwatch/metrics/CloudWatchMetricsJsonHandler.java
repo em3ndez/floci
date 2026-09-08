@@ -1,20 +1,24 @@
 package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
-import io.github.hectorvent.floci.core.common.AwsErrorResponse;
-import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
-import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
-import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsErrorResponse;
+import io.github.hectorvent.floci.services.cloudwatch.dashboards.CloudWatchDashboardsService;
+import io.github.hectorvent.floci.services.cloudwatch.dashboards.model.Dashboard;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
-
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import org.jboss.logging.Logger;
 
 /**
  * Handles CloudWatch Metrics requests via the JSON 1.0 protocol.
@@ -23,17 +27,23 @@ import java.util.List;
 @ApplicationScoped
 public class CloudWatchMetricsJsonHandler {
 
+    private static final Logger LOG = Logger.getLogger(CloudWatchMetricsJsonHandler.class);
     private final CloudWatchMetricsService metricsService;
+    private final CloudWatchDashboardsService dashboardsService;
     private final ObjectMapper objectMapper;
 
     @Inject
-    public CloudWatchMetricsJsonHandler(CloudWatchMetricsService metricsService, ObjectMapper objectMapper) {
+    public CloudWatchMetricsJsonHandler(CloudWatchMetricsService metricsService,
+                                        CloudWatchDashboardsService dashboardsService,
+                                        ObjectMapper objectMapper) {
         this.metricsService = metricsService;
+        this.dashboardsService = dashboardsService;
         this.objectMapper = objectMapper;
     }
 
     public Response handle(String action, JsonNode request, String region) {
-        return switch (action) {
+        String normalizedAction = action.substring(0, 1).toUpperCase() + action.substring(1);
+        return switch (normalizedAction) {
             case "PutMetricData" -> handlePutMetricData(request, region);
             case "ListMetrics" -> handleListMetrics(request, region);
             case "GetMetricStatistics" -> handleGetMetricStatistics(request, region);
@@ -41,16 +51,26 @@ public class CloudWatchMetricsJsonHandler {
             case "DescribeAlarms" -> handleDescribeAlarms(request, region);
             case "DeleteAlarms" -> handleDeleteAlarms(request, region);
             case "SetAlarmState" -> handleSetAlarmState(request, region);
-            case "GetMetricData" -> Response.ok(objectMapper.createObjectNode().putArray("MetricDataResults")).build();
+            case "ListTagsForResource" -> handleListTagsForResource(request, region);
+            case "TagResource" -> handleTagResource(request, region);
+            case "UntagResource" -> handleUntagResource(request, region);
+            case "GetMetricData" -> handleGetMetricData(request, region);
+            case "PutDashboard" -> handlePutDashboard(request, region);
+            case "GetDashboard" -> handleGetDashboard(request, region);
+            case "ListDashboards" -> handleListDashboards(request, region);
+            case "DeleteDashboards" -> handleDeleteDashboards(request, region);
             default -> Response.status(400)
-                    .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported."))
+                    .entity(new AwsErrorResponse("UnsupportedOperation", "Operation " + action + " is not supported by CloudWatch JSON."))
                     .build();
         };
     }
 
     private Response handlePutMetricData(JsonNode request, String region) {
         String namespace = request.path("Namespace").asText();
+        LOG.infov("JSON PutMetricData raw: {0}", request);
         List<MetricDatum> datums = parseMetricDataJson(request.path("MetricData"));
+        LOG.infov("JSON PutMetricData parsed {0} datums, sums={1}", datums.size(),
+                datums.stream().map(d -> d.getMetricName() + "=" + d.getSum()).toList());
         metricsService.putMetricData(namespace, datums, region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
@@ -84,8 +104,8 @@ public class CloudWatchMetricsJsonHandler {
         String metricName = request.path("MetricName").asText();
         List<Dimension> dimensions = parseDimensionsJson(request.path("Dimensions"));
         int period = request.path("Period").asInt(60);
-        Instant startTime = parseInstant(request.path("StartTime").asText(null));
-        Instant endTime = parseInstant(request.path("EndTime").asText(null));
+        Instant startTime = parseInstantNode(request.path("StartTime"));
+        Instant endTime = parseInstantNode(request.path("EndTime"));
 
         List<String> statistics = new ArrayList<>();
         JsonNode statsNode = request.path("Statistics");
@@ -138,6 +158,17 @@ public class CloudWatchMetricsJsonHandler {
         if (okActions.isArray()) {
             okActions.forEach(a -> alarm.getOkActions().add(a.asText()));
         }
+        JsonNode insufficientDataActions = request.path("InsufficientDataActions");
+        if (insufficientDataActions.isArray()) {
+            insufficientDataActions.forEach(a -> alarm.getInsufficientDataActions().add(a.asText()));
+        }
+
+        JsonNode tagsNode = request.has("Tags") ? request.path("Tags") : request.path("tags");
+        if (tagsNode.isArray()) {
+            Map<String, String> tags = new LinkedHashMap<>();
+            tagsNode.forEach(t -> tags.put(t.path("Key").asText(), t.path("Value").asText()));
+            alarm.setTags(tags);
+        }
 
         metricsService.putMetricAlarm(alarm, region);
         return Response.ok(objectMapper.createObjectNode()).build();
@@ -160,15 +191,31 @@ public class CloudWatchMetricsJsonHandler {
             node.put("AlarmName", a.getAlarmName());
             if (a.getAlarmArn() != null) node.put("AlarmArn", a.getAlarmArn());
             if (a.getAlarmDescription() != null) node.put("AlarmDescription", a.getAlarmDescription());
+            ArrayNode alarmActions = node.putArray("AlarmActions");
+            a.getAlarmActions().forEach(alarmActions::add);
+            ArrayNode okActions = node.putArray("OKActions");
+            a.getOkActions().forEach(okActions::add);
+            ArrayNode insufficientDataActions = node.putArray("InsufficientDataActions");
+            a.getInsufficientDataActions().forEach(insufficientDataActions::add);
             if (a.getMetricName() != null) node.put("MetricName", a.getMetricName());
             if (a.getNamespace() != null) node.put("Namespace", a.getNamespace());
             if (a.getStatistic() != null) node.put("Statistic", a.getStatistic());
+            ArrayNode dimensions = node.putArray("Dimensions");
+            a.getDimensions().forEach(d -> {
+                ObjectNode dimNode = dimensions.addObject();
+                dimNode.put("Name", d.name());
+                dimNode.put("Value", d.value());
+            });
             node.put("Period", a.getPeriod());
             node.put("EvaluationPeriods", a.getEvaluationPeriods());
             node.put("Threshold", a.getThreshold());
             if (a.getComparisonOperator() != null) node.put("ComparisonOperator", a.getComparisonOperator());
             node.put("ActionsEnabled", a.isActionsEnabled());
             if (a.getStateValue() != null) node.put("StateValue", a.getStateValue());
+            if (a.getStateReason() != null) node.put("StateReason", a.getStateReason());
+            if (a.getStateReasonData() != null) node.put("StateReasonData", a.getStateReasonData());
+            node.put("StateUpdatedTimestamp", a.getStateUpdatedTimestamp());
+
         }
         return Response.ok(response).build();
     }
@@ -192,6 +239,168 @@ public class CloudWatchMetricsJsonHandler {
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
+    private Response handleListTagsForResource(JsonNode request, String region) {
+        String arn = request.has("ResourceARN") ? request.path("ResourceARN").asText() : request.path("ResourceArn").asText();
+        if (arn.isEmpty()) arn = request.path("resourceArn").asText();
+
+        Map<String, String> tags = CloudWatchDashboardsService.isDashboardArn(arn)
+                ? dashboardsService.listTagsForResource(arn, region)
+                : metricsService.listTagsForResource(arn, region);
+        ArrayNode tagsArray = objectMapper.createArrayNode();
+        tags.forEach((k, v) -> tagsArray.addObject().put("Key", k).put("Value", v));
+        return Response.ok(objectMapper.createObjectNode().set("Tags", tagsArray)).build();
+    }
+
+    private Response handleTagResource(JsonNode request, String region) {
+        String arn = request.has("ResourceARN") ? request.path("ResourceARN").asText() : request.path("ResourceArn").asText();
+        if (arn.isEmpty()) arn = request.path("resourceArn").asText();
+
+        Map<String, String> tags = new LinkedHashMap<>();
+        JsonNode tagsNode = request.has("Tags") ? request.path("Tags") : request.path("tags");
+        if (tagsNode.isArray()) {
+            tagsNode.forEach(t -> tags.put(t.path("Key").asText(), t.path("Value").asText()));
+        }
+        if (CloudWatchDashboardsService.isDashboardArn(arn)) {
+            dashboardsService.tagResource(arn, tags, region);
+        } else {
+            metricsService.tagResource(arn, tags, region);
+        }
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleUntagResource(JsonNode request, String region) {
+        String arn = request.has("ResourceARN") ? request.path("ResourceARN").asText() : request.path("ResourceArn").asText();
+        if (arn.isEmpty()) arn = request.path("resourceArn").asText();
+
+        List<String> keys = new ArrayList<>();
+        JsonNode keysNode = request.has("TagKeys") ? request.path("TagKeys") : request.path("tagKeys");
+        if (keysNode.isArray()) {
+            keysNode.forEach(k -> keys.add(k.asText()));
+        }
+        if (CloudWatchDashboardsService.isDashboardArn(arn)) {
+            dashboardsService.untagResource(arn, keys, region);
+        } else {
+            metricsService.untagResource(arn, keys, region);
+        }
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleGetMetricData(JsonNode request, String region) {
+        Instant startTime = parseInstantNode(request.path("StartTime"));
+        Instant endTime = parseInstantNode(request.path("EndTime"));
+
+        List<CloudWatchMetricsService.MetricDataQuery> queries = new ArrayList<>();
+        JsonNode queriesNode = request.path("MetricDataQueries");
+        if (queriesNode.isArray()) {
+            for (JsonNode qNode : queriesNode) {
+                String id = qNode.path("Id").asText();
+                String expression = qNode.has("Expression") ? qNode.path("Expression").asText() : null;
+                String label = qNode.has("Label") ? qNode.path("Label").asText() : null;
+                boolean returnData = qNode.path("ReturnData").asBoolean(true);
+
+                CloudWatchMetricsService.MetricStat metricStat = null;
+                JsonNode msNode = qNode.path("MetricStat");
+                if (!msNode.isMissingNode()) {
+                    JsonNode metricNode = msNode.path("Metric");
+                    String namespace = metricNode.path("Namespace").asText();
+                    String metricName = metricNode.path("MetricName").asText();
+                    int period = msNode.path("Period").asInt(60);
+                    String stat = msNode.path("Stat").asText();
+                    String unit = msNode.has("Unit") ? msNode.path("Unit").asText() : null;
+                    List<Dimension> dims = parseDimensionsJson(metricNode.path("Dimensions"));
+
+                    metricStat = new CloudWatchMetricsService.MetricStat(
+                            namespace, metricName, dims, period, stat, unit);
+                }
+
+                queries.add(new CloudWatchMetricsService.MetricDataQuery(
+                        id, metricStat, expression, label, returnData));
+            }
+        }
+
+        List<CloudWatchMetricsService.MetricDataResult> results =
+                metricsService.getMetricData(queries, startTime, endTime, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode resultsArray = response.putArray("MetricDataResults");
+        for (var r : results) {
+            ObjectNode rNode = resultsArray.addObject();
+            rNode.put("Id", r.id());
+            rNode.put("Label", r.label());
+            rNode.put("StatusCode", r.statusCode());
+
+            ArrayNode tsArray = rNode.putArray("Timestamps");
+            for (Instant ts : r.timestamps()) {
+                tsArray.add(ts.getEpochSecond());
+            }
+
+            ArrayNode valArray = rNode.putArray("Values");
+            for (Double v : r.values()) {
+                valArray.add(v);
+            }
+        }
+        return Response.ok(response).build();
+    }
+
+    // ──────────────────────────── Dashboards ────────────────────────────
+
+    private Response handlePutDashboard(JsonNode request, String region) {
+        Map<String, String> tags = new LinkedHashMap<>();
+        JsonNode tagsNode = request.path("Tags");
+        if (tagsNode.isArray()) {
+            tagsNode.forEach(t -> tags.put(t.path("Key").asText(), t.path("Value").asText()));
+        }
+        dashboardsService.putDashboard(
+                request.path("DashboardName").asText(null),
+                request.path("DashboardBody").asText(null),
+                tags,
+                region);
+        // DashboardValidationMessages is optional on the response shape, but AWS always
+        // sends the list. It stays empty here: the body is stored opaquely, so nothing
+        // inspects it and no validation warning can be produced.
+        ObjectNode response = objectMapper.createObjectNode();
+        response.putArray("DashboardValidationMessages");
+        return Response.ok(response).build();
+    }
+
+    private Response handleGetDashboard(JsonNode request, String region) {
+        Dashboard dashboard = dashboardsService.getDashboard(
+                request.path("DashboardName").asText(null), region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("DashboardArn", dashboard.getDashboardArn());
+        response.put("DashboardName", dashboard.getDashboardName());
+        response.put("DashboardBody", dashboard.getDashboardBody());
+        return Response.ok(response).build();
+    }
+
+    private Response handleListDashboards(JsonNode request, String region) {
+        String prefix = request.has("DashboardNamePrefix")
+                ? request.path("DashboardNamePrefix").asText() : null;
+        List<Dashboard> dashboards = dashboardsService.listDashboards(prefix, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode entries = response.putArray("DashboardEntries");
+        for (Dashboard d : dashboards) {
+            ObjectNode node = entries.addObject();
+            node.put("DashboardName", d.getDashboardName());
+            node.put("DashboardArn", d.getDashboardArn());
+            node.put("LastModified", d.getLastModified());
+            node.put("Size", d.getSize());
+        }
+        return Response.ok(response).build();
+    }
+
+    private Response handleDeleteDashboards(JsonNode request, String region) {
+        List<String> names = new ArrayList<>();
+        JsonNode namesNode = request.path("DashboardNames");
+        if (namesNode.isArray()) {
+            namesNode.forEach(n -> names.add(n.asText()));
+        }
+        dashboardsService.deleteDashboards(names, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
     private List<MetricDatum> parseMetricDataJson(JsonNode node) {
         List<MetricDatum> datums = new ArrayList<>();
         if (!node.isArray()) return datums;
@@ -202,10 +411,19 @@ public class CloudWatchMetricsJsonHandler {
             datum.setUnit(item.path("Unit").asText(null));
             JsonNode ts = item.path("Timestamp");
             if (!ts.isMissingNode()) {
-                Instant parsed = parseInstant(ts.asText(null));
+                Instant parsed = parseInstantNode(ts);
                 if (parsed != null) datum.setTimestamp(parsed.getEpochSecond());
             }
             datum.setDimensions(parseDimensionsJson(item.path("Dimensions")));
+
+            JsonNode statsValues = item.path("StatisticValues");
+            if (!statsValues.isMissingNode()) {
+                datum.setSampleCount(statsValues.path("SampleCount").asDouble(0));
+                datum.setSum(statsValues.path("Sum").asDouble(0));
+                datum.setMinimum(statsValues.path("Minimum").asDouble(0));
+                datum.setMaximum(statsValues.path("Maximum").asDouble(0));
+            }
+
             datums.add(datum);
         }
         return datums;
@@ -218,6 +436,17 @@ public class CloudWatchMetricsJsonHandler {
             dims.add(new Dimension(d.path("Name").asText(), d.path("Value").asText()));
         }
         return dims;
+    }
+
+    /**
+     * Parse a JsonNode that may be a numeric epoch (long/double) or an ISO-8601 string.
+     */
+    private Instant parseInstantNode(JsonNode node) {
+        if (node == null || node.isMissingNode() || node.isNull()) return null;
+        if (node.isNumber()) {
+            return Instant.ofEpochSecond(node.asLong());
+        }
+        return parseInstant(node.asText(null));
     }
 
     private Instant parseInstant(String value) {
